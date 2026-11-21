@@ -379,12 +379,26 @@ impl Explorer {
         }
     }
 
+    /// Whether a new file or folder is being named. The name field passes on
+    /// keys it doesn't use (Enter after it's handled them, the arrow keys),
+    /// and the tree's own shortcuts would act on them: Enter would open or
+    /// collapse the selected row, taking the field (and its error) away.
+    fn naming(&self) -> bool {
+        self.new_entry.is_some()
+    }
+
     fn select_previous(&mut self, _: &SelectPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        if self.naming() {
+            return;
+        }
         let ix = self.selected_index().map_or(0, |ix| ix.saturating_sub(1));
         self.select_index(ix, cx);
     }
 
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+        if self.naming() {
+            return;
+        }
         let ix = self
             .selected_index()
             .map_or(0, |ix| (ix + 1).min(self.entries.len().saturating_sub(1)));
@@ -392,6 +406,9 @@ impl Explorer {
     }
 
     fn expand_selected(&mut self, _: &ExpandSelected, _: &mut Window, cx: &mut Context<Self>) {
+        if self.naming() {
+            return;
+        }
         let Some(ix) = self.selected_index() else {
             return;
         };
@@ -411,6 +428,9 @@ impl Explorer {
     }
 
     fn collapse_selected(&mut self, _: &CollapseSelected, _: &mut Window, cx: &mut Context<Self>) {
+        if self.naming() {
+            return;
+        }
         let Some(ix) = self.selected_index() else {
             return;
         };
@@ -426,6 +446,9 @@ impl Explorer {
     }
 
     fn open_selected(&mut self, _: &OpenSelected, _: &mut Window, cx: &mut Context<Self>) {
+        if self.naming() {
+            return;
+        }
         let Some(ix) = self.selected_index() else {
             return;
         };
