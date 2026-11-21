@@ -1406,14 +1406,48 @@ impl Workspace {
     // ---- Rendering ---------------------------------------------------------
 
     /// The title bar, drawn by the app in place of the system one: the menu
-    /// bar, the window title, and (added by `TitleBar` on Windows and Linux)
-    /// the minimize, maximize and close buttons. Drag the empty space or the
-    /// title to move the window; double-click it to maximize.
+    /// bar, a button that shows or hides the explorer, the window title, and
+    /// (added by `TitleBar` on Windows and Linux) the minimize, maximize and
+    /// close buttons. Drag the empty space or the title to move the window;
+    /// double-click it to maximize.
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
+        let (sidebar_icon, sidebar_tooltip) = if self.sidebar_visible {
+            (IconName::PanelLeftClose, "Hide explorer")
+        } else {
+            (IconName::PanelLeftOpen, "Show explorer")
+        };
 
         TitleBar::new()
-            .child(div().flex_none().h_full().child(self.menu_bar.clone()))
+            .child(
+                div()
+                    .h_flex()
+                    .flex_none()
+                    .h_full()
+                    .items_center()
+                    .gap_1()
+                    .child(div().flex_none().h_full().child(self.menu_bar.clone()))
+                    .child(
+                        div()
+                            .flex_none()
+                            // The title bar moves the window when pressed: claim
+                            // the press so it clicks the button instead.
+                            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                window.prevent_default();
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                Button::new("toggle-sidebar")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(sidebar_icon)
+                                    .tooltip(format!("{sidebar_tooltip} ({})", shortcut("B")))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_sidebar(&ToggleSidebar, window, cx)
+                                    })),
+                            ),
+                    ),
+            )
             .child(
                 div()
                     .h_flex()
