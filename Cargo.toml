@@ -1,0 +1,23 @@
+[package]
+name = "gpui-editor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Terminal emulation and the PTY (ConPTY on Windows) for the terminal panel.
+alacritty_terminal = "0.26"
+futures = "0.3"
+# Each tree-sitter-* feature adds syntax highlighting for one language.
+# JSON highlighting is built in. Add more from gpui-kit's feature list as needed.
+gpui-kit = { version = "0.9", features = [
+    "tree-sitter-bash",
+    "tree-sitter-css",
+    "tree-sitter-html",
+    "tree-sitter-javascript",
+    "tree-sitter-markdown",
+    "tree-sitter-python",
+    "tree-sitter-rust",
+    "tree-sitter-toml",
+    "tree-sitter-typescript",
+    "tree-sitter-yaml",
+] }
