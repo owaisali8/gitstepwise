@@ -8,7 +8,7 @@ edition = "2024"
 alacritty_terminal = "0.26"
 futures = "0.3"
 # Line diffs against the last Git commit, for the gutter and the Changes view.
-similar = "2"
+similar = "3"
 # Watches the repository so each edit becomes a step in the edit timeline,
 # which is kept in .git as JSON until the next commit.
 notify = "8"
