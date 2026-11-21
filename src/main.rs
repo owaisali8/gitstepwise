@@ -6,6 +6,10 @@
 //! `cargo run -- some/folder` to show that folder in the explorer.
 //! A path that doesn't exist yet opens as a new, empty file at that path.
 
+// On Windows a release build is a windowed app, without a console window
+// behind it. Debug builds keep the console, for `eprintln!` output.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod changes;
 mod explorer;
 mod git;
@@ -868,10 +872,10 @@ impl Workspace {
         };
         let current = self.documents[ix].path.clone();
         if let (Some(path), false) = (current.clone(), save_as) {
-            if self.write_to(id, path, window, cx) {
-                if let Some(then) = then {
-                    then(self, window, cx);
-                }
+            if self.write_to(id, path, window, cx)
+                && let Some(then) = then
+            {
+                then(self, window, cx);
             }
             return;
         }
@@ -892,10 +896,10 @@ impl Workspace {
                 return;
             };
             this.update_in(cx, |this, window, cx| {
-                if this.write_to(id, path, window, cx) {
-                    if let Some(then) = then {
-                        then(this, window, cx);
-                    }
+                if this.write_to(id, path, window, cx)
+                    && let Some(then) = then
+                {
+                    then(this, window, cx);
                 }
             })
             .ok();

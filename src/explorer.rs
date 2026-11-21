@@ -210,10 +210,10 @@ impl Explorer {
                 InputEvent::PressEnter { .. } => this.create_new_entry(window, cx),
                 InputEvent::Blur => this.cancel_new_entry(cx),
                 InputEvent::Change => {
-                    if let Some(new_entry) = &mut this.new_entry {
-                        if new_entry.error.take().is_some() {
-                            cx.notify();
-                        }
+                    if let Some(new_entry) = &mut this.new_entry
+                        && new_entry.error.take().is_some()
+                    {
+                        cx.notify();
                     }
                 }
                 InputEvent::Focus => {}
@@ -418,10 +418,10 @@ impl Explorer {
         if entry.is_dir && self.expanded.contains(&entry.path) {
             let path = entry.path.clone();
             self.toggle(&path, cx);
-        } else if let Some(parent) = entry.path.parent().filter(|parent| *parent != self.root) {
-            if let Some(parent_ix) = self.index_of(parent) {
-                self.select_index(parent_ix, cx);
-            }
+        } else if let Some(parent) = entry.path.parent().filter(|parent| *parent != self.root)
+            && let Some(parent_ix) = self.index_of(parent)
+        {
+            self.select_index(parent_ix, cx);
         }
     }
 

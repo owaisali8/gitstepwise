@@ -1,0 +1,52 @@
+# Publishes a GitHub Release with the Windows app when a version tag is
+# pushed:
+#
+#   git tag v0.1.0
+#   git push origin v0.1.0
+#
+# The tag must match the version in Cargo.toml.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Build and publish (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} doesn't match version $version in Cargo.toml."
+          }
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # The app embeds its icons and grammars, so the .exe is all it needs.
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $exe = "gitstepwise-${{ github.ref_name }}-windows-x64.exe"
+          Copy-Item target/release/gitstepwise.exe $exe
+          gh release create "${{ github.ref_name }}" $exe `
+            --title "Gitstepwise ${{ github.ref_name }}" `
+            --generate-notes

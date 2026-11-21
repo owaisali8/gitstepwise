@@ -487,7 +487,7 @@ impl Render for TerminalView {
                     move |bounds, window, cx| {
                         layout_frame(&entity, &term, palette, font_family, font_size, focused, bounds, window, cx)
                     },
-                    |bounds, frame, window, cx| paint_frame(bounds, frame, window, cx),
+                    paint_frame,
                 )
                 .size_full(),
             )
@@ -565,12 +565,12 @@ fn layout_frame(
         let mut fg = palette.resolve(cell_data.fg, content.colors);
         let mut bg = palette.resolve(cell_data.bg, content.colors);
         // Bold text in one of the 8 base colors shows in its bright variant.
-        if flags.contains(Flags::BOLD) {
-            if let AnsiColor::Named(name) = cell_data.fg {
-                if (name as usize) < 8 && content.colors[name].is_none() {
-                    fg = palette.ansi[name as usize + 8];
-                }
-            }
+        if flags.contains(Flags::BOLD)
+            && let AnsiColor::Named(name) = cell_data.fg
+            && (name as usize) < 8
+            && content.colors[name].is_none()
+        {
+            fg = palette.ansi[name as usize + 8];
         }
         if flags.contains(Flags::INVERSE) {
             std::mem::swap(&mut fg, &mut bg);
@@ -810,10 +810,11 @@ fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> 
         "space" if m.control => vec![0],
         _ => {
             // AltGr arrives as Ctrl+Alt on Windows; it types a character.
-            if m.control && m.alt {
-                if let Some(text) = &keystroke.key_char {
-                    return Some(text.clone().into_bytes());
-                }
+            if m.control
+                && m.alt
+                && let Some(text) = &keystroke.key_char
+            {
+                return Some(text.clone().into_bytes());
             }
             if m.control {
                 let mut chars = key.chars();

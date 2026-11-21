@@ -1,0 +1,48 @@
+# Builds, tests and lints every push to main and every pull request.
+#
+# It runs on Windows, the platform Gitstepwise is developed and tested on.
+# Embedding the app icon also needs the Windows SDK's resource compiler,
+# which the Windows runners include.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request replaces a run in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Build, test and lint
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # GPUI and the tree-sitter grammars take a long time to build from
+      # scratch; this keeps compiled dependencies between runs.
+      - uses: Swatinem/rust-cache@v2
+
+      # --locked: fail if Cargo.lock is out of date rather than update it.
+      - name: Build
+        run: cargo build --locked --all-targets
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
