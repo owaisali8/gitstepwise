@@ -5,7 +5,7 @@
 //! A file watcher notices each write. A step's "before" is what the file
 //! held after its previous step, or in the last commit, so editing one file,
 //! then another, then the first again makes three steps. The timeline is
-//! kept in `.git/gpui-editor/timeline.json` and starts afresh after each
+//! kept in `.git/gitstepwise/timeline.json` and starts afresh after each
 //! commit.
 
 use std::collections::{HashMap, HashSet};
@@ -158,7 +158,9 @@ impl State {
     /// The saved timeline, with what changed while the editor was closed
     /// added; or a fresh one if there's none, or it's from an older commit.
     fn load(repo: &Repo) -> Self {
+        // Before the app was renamed, the timeline lived under the old name.
         let saved: Option<Self> = std::fs::read(state_file(repo))
+            .or_else(|_| std::fs::read(repo.git_dir.join(OLD_STATE_FOLDER).join(STATE_FILE)))
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
         let mut state = match saved {
@@ -197,8 +199,13 @@ impl State {
     }
 }
 
+/// The timeline's folder in `.git`, and where it was as "GPUI Editor".
+const STATE_FOLDER: &str = "gitstepwise";
+const OLD_STATE_FOLDER: &str = "gpui-editor";
+const STATE_FILE: &str = "timeline.json";
+
 fn state_file(repo: &Repo) -> PathBuf {
-    repo.git_dir.join("gpui-editor").join("timeline.json")
+    repo.git_dir.join(STATE_FOLDER).join(STATE_FILE)
 }
 
 /// A file's contents now. `None` if it can't be read at the moment (say, a

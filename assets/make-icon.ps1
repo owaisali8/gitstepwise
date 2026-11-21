@@ -6,7 +6,7 @@
 # Sizes up to 40 px use the simplified logo-small.svg; larger ones logo.svg.
 param(
     [string]$Assets = $PSScriptRoot,
-    [string]$Work = (Join-Path $env:TEMP "gpui-editor-icon")
+    [string]$Work = (Join-Path $env:TEMP "gitstepwise-icon")
 )
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing

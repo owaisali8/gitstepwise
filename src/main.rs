@@ -1,5 +1,6 @@
-//! A small text editor built on GPUI Kit, with a file explorer, tabs and a
-//! terminal.
+//! Gitstepwise: a small text editor built on GPUI Kit, with a file
+//! explorer, tabs and a terminal, for reviewing what changed (say, what a
+//! coding agent wrote) step by step before committing it to Git.
 //!
 //! Run with `cargo run`, or `cargo run -- file1 file2` to open files, or
 //! `cargo run -- some/folder` to show that folder in the explorer.
@@ -62,7 +63,7 @@ gpui_kit::actions!(
     ]
 );
 
-const APP_NAME: &str = "GPUI Editor";
+const APP_NAME: &str = "Gitstepwise";
 const KEY_CONTEXT: &str = "TextEditor";
 const PLAIN_TEXT: &str = "text";
 const MIN_TERMINAL_HEIGHT: Pixels = px(80.);
@@ -252,7 +253,7 @@ struct Status {
     is_error: bool,
 }
 
-/// Opt-in frame-rate meter. Run with `GPUI_EDITOR_FPS=1` and the window
+/// Opt-in frame-rate meter. Run with `GITSTEPWISE_FPS=1` and the window
 /// redraws every frame, showing the measured rate in the status bar (and
 /// printing it to stderr once a second).
 struct FpsMeter {
@@ -266,7 +267,7 @@ struct FpsMeter {
 
 impl FpsMeter {
     fn from_env() -> Option<Self> {
-        std::env::var_os("GPUI_EDITOR_FPS")?;
+        std::env::var_os("GITSTEPWISE_FPS")?;
         let now = Instant::now();
         Some(Self {
             frames: 0,
@@ -768,7 +769,7 @@ impl Workspace {
         }
     }
 
-    /// "● name — GPUI Editor", with the dot when there are unsaved changes.
+    /// "● name — Gitstepwise", with the dot when there are unsaved changes.
     fn window_title(&self) -> String {
         if self.changes_active {
             return format!("Changes — {APP_NAME}");

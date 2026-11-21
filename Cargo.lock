@@ -1942,6 +1942,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1033caf0b349c518623b5396bfb2cf0bddf44f0306d543a250e5743297aafd10"
 
 [[package]]
+name = "gitstepwise"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "embed-resource",
+ "futures",
+ "gpui-kit",
+ "notify",
+ "serde",
+ "serde_json",
+ "similar",
+]
+
+[[package]]
 name = "gl_generator"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2127,20 +2141,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "gpui-editor"
-version = "0.1.0"
-dependencies = [
- "alacritty_terminal",
- "embed-resource",
- "futures",
- "gpui-kit",
- "notify",
- "serde",
- "serde_json",
- "similar",
 ]
 
 [[package]]
