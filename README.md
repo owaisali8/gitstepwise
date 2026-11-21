@@ -45,7 +45,7 @@ was made. Step through until you've seen everything, then commit.
 
 **The editor itself**
 
-- Tabs, a file explorer (with New File), and an integrated terminal.
+- Tabs, a file explorer (with New File and New Folder), and an integrated terminal.
 - Syntax highlighting for Rust, TOML, Markdown, Python, JavaScript, TypeScript,
   HTML, CSS, JSON, YAML and shell scripts.
 - Word wrap, line numbers, zoom, and light and dark themes.

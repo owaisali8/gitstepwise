@@ -78,7 +78,7 @@ const MAX_FONT_SIZE: Pixels = px(40.);
 const FONT_SIZE_STEP: Pixels = px(1.);
 
 // Icons beyond the kit's default set, embedded on top of it.
-gpui_kit::assets::icon_assets!(ExtraIcons, [Circle, FilePlus, GitBranch]);
+gpui_kit::assets::icon_assets!(ExtraIcons, [Circle, FilePlus, FolderPlus, GitBranch]);
 
 struct AppAssets;
 
