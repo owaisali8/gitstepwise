@@ -1,0 +1,4 @@
+// The app icon. Windows shows icon 1 for the .exe in Explorer, and gpui
+// loads it for its windows and the taskbar. icon.ico is built from
+// logo.svg (48 px and up) and logo-small.svg (16 to 40 px).
+1 ICON "icon.ico"

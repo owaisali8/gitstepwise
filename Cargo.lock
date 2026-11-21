@@ -2134,6 +2134,7 @@ name = "gpui-editor"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
+ "embed-resource",
  "futures",
  "gpui-kit",
  "notify",
