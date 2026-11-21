@@ -332,7 +332,9 @@ struct Workspace {
     changed_files: usize,
     /// Every changed file in the repository, shown in place of the editor.
     changes: Entity<ChangesView>,
-    changes_visible: bool,
+    /// The Changes tab: whether it's open, and whether it's the tab showing.
+    changes_open: bool,
+    changes_active: bool,
     _repo_task: Option<Task<()>>,
     _changes_task: Option<Task<()>>,
     _repo_watch: Task<()>,
@@ -412,7 +414,8 @@ impl Workspace {
             branch: None,
             changed_files: 0,
             changes,
-            changes_visible: false,
+            changes_open: false,
+            changes_active: false,
             _repo_task: None,
             _changes_task: None,
             _repo_watch: repo_watch,
@@ -580,17 +583,39 @@ impl Workspace {
             return;
         }
         self.active = ix;
-        // Switching to a file leaves the Changes view.
-        self.changes_visible = false;
+        // Switching to a file leaves the Changes tab open but not showing.
+        self.changes_active = false;
         self.focus_active(window, cx);
         self.update_title(window);
         self.sync_explorer(cx);
         cx.notify();
     }
 
+    /// The Changes tab's position in the tab bar, after the files, if it's open.
+    fn changes_tab_index(&self) -> Option<usize> {
+        self.changes_open.then_some(self.documents.len())
+    }
+
+    /// The position in the tab bar of the tab showing.
+    fn active_tab_index(&self) -> usize {
+        match self.changes_tab_index() {
+            Some(ix) if self.changes_active => ix,
+            _ => self.active,
+        }
+    }
+
+    /// Show the tab at `ix`: a file, or the Changes tab.
+    fn select_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if Some(ix) == self.changes_tab_index() {
+            self.show_changes(None, window, cx);
+        } else {
+            self.activate(ix, window, cx);
+        }
+    }
+
     /// Focus what the main area shows: the active editor, or the Changes view.
     fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.changes_visible {
+        if self.changes_active {
             self.changes.read(cx).focus_handle(cx).focus(window, cx);
             return;
         }
@@ -709,6 +734,9 @@ impl Workspace {
 
     /// "● name — GPUI Editor", with the dot when there are unsaved changes.
     fn window_title(&self) -> String {
+        if self.changes_active {
+            return format!("Changes — {APP_NAME}");
+        }
         let Some(doc) = self.documents.get(self.active) else {
             return APP_NAME.into();
         };
@@ -725,7 +753,7 @@ impl Workspace {
     fn sync_menus(&mut self, cx: &mut Context<Self>) {
         let checks = MenuChecks {
             sidebar: self.sidebar_visible,
-            changes: self.changes_visible,
+            changes: self.changes_open,
             terminal: self.terminal_visible,
             soft_wrap: self.soft_wrap,
             line_numbers: self.line_numbers,
@@ -1110,7 +1138,7 @@ impl Workspace {
             .filter(|doc| doc.dirty)
             .filter_map(|doc| Some((doc.path.clone()?, doc.editor.read(cx).value().to_string())))
             .collect();
-        let with_diffs = self.changes_visible;
+        let with_diffs = self.changes_open;
 
         let root = repo.root.clone();
         self._changes_task = Some(cx.spawn(async move |this, cx| {
@@ -1162,10 +1190,10 @@ impl Workspace {
         }));
     }
 
-    /// Show or hide every change since the last commit, in place of the editor.
+    /// Open the Changes tab (or switch to it); close it if it's showing.
     fn toggle_changes(&mut self, _: &ToggleChanges, window: &mut Window, cx: &mut Context<Self>) {
-        if self.changes_visible {
-            self.hide_changes(window, cx);
+        if self.changes_active {
+            self.close_changes(window, cx);
             return;
         }
         // Reviewing picks up at the first file not yet reviewed; showing
@@ -1194,19 +1222,24 @@ impl Workspace {
         self.show_changes(None, window, cx);
     }
 
+    /// Open the Changes tab, or switch to it, and bring its changes up to date.
     fn show_changes(&mut self, select: Option<Select>, window: &mut Window, cx: &mut Context<Self>) {
-        self.changes_visible = true;
+        self.changes_open = true;
+        self.changes_active = true;
         if let Some(select) = select {
             self.changes.update(cx, |view, _| view.select_on_load(select));
         }
         self.refresh_changes(cx);
-        self.changes.read(cx).focus_handle(cx).focus(window, cx);
+        self.focus_active(window, cx);
+        self.update_title(window);
         cx.notify();
     }
 
-    fn hide_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.changes_visible = false;
+    fn close_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.changes_open = false;
+        self.changes_active = false;
         self.focus_active(window, cx);
+        self.update_title(window);
         cx.notify();
     }
 
@@ -1220,7 +1253,7 @@ impl Workspace {
         match event {
             ChangesEvent::OpenFile { path, line } => self.open_at(path.clone(), *line, window, cx),
             ChangesEvent::Refresh => self.refresh_git(cx),
-            ChangesEvent::Close => self.hide_changes(window, cx),
+            ChangesEvent::Close => self.close_changes(window, cx),
         }
     }
 
@@ -1341,19 +1374,28 @@ impl Workspace {
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.changes_active {
+            self.close_changes(window, cx);
+            return;
+        }
         let id = self.active_document().id;
         self.close_document(id, window, cx);
     }
 
+    /// How many tabs there are: the files, and the Changes tab if it's open.
+    fn tab_count(&self) -> usize {
+        self.documents.len() + usize::from(self.changes_open)
+    }
+
     fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
-        let ix = (self.active + 1) % self.documents.len();
-        self.activate(ix, window, cx);
+        let ix = (self.active_tab_index() + 1) % self.tab_count();
+        self.select_tab(ix, window, cx);
     }
 
     fn previous_tab(&mut self, _: &PreviousTab, window: &mut Window, cx: &mut Context<Self>) {
-        let count = self.documents.len();
-        let ix = (self.active + count - 1) % count;
-        self.activate(ix, window, cx);
+        let count = self.tab_count();
+        let ix = (self.active_tab_index() + count - 1) % count;
+        self.select_tab(ix, window, cx);
     }
 
     fn toggle_soft_wrap(&mut self, _: &ToggleSoftWrap, window: &mut Window, cx: &mut Context<Self>) {
@@ -1461,10 +1503,29 @@ impl Workspace {
             )
     }
 
+    /// A tab for each open file, then the Changes tab if it's open.
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let changes_tab = self.changes_open.then(|| {
+            // The icon goes in the prefix: a tab with `.icon()` shows only the icon.
+            Tab::new()
+                .prefix(div().pl_2().child(Icon::new(LucideIcon::GitBranch).small()))
+                .label("Changes")
+                .suffix(
+                    Button::new("close-changes-tab")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .tooltip(format!("Close ({})", shortcut("W")))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.close_changes(window, cx);
+                        })),
+                )
+        });
+
         TabBar::new("documents")
-            .selected_index(self.active)
-            .on_click(cx.listener(|this, ix: &usize, window, cx| this.activate(*ix, window, cx)))
+            .selected_index(self.active_tab_index())
+            .on_click(cx.listener(|this, ix: &usize, window, cx| this.select_tab(*ix, window, cx)))
             .children(self.documents.iter().map(|doc| {
                 let id = doc.id;
                 let label = if doc.dirty {
@@ -1484,6 +1545,7 @@ impl Workspace {
                         })),
                 )
             }))
+            .children(changes_tab)
     }
 
     fn render_terminal_panel(&self, terminal: &Entity<TerminalView>, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1769,12 +1831,13 @@ impl Render for Workspace {
                             .flex_1()
                             .min_w_0()
                             .h_full()
+                            .child(self.render_tab_bar(cx))
                             .map(|column| {
-                                if self.changes_visible {
+                                if self.changes_active {
                                     return column
                                         .child(div().flex_1().min_h_0().child(self.changes.clone()));
                                 }
-                                column.child(self.render_tab_bar(cx)).child(
+                                column.child(
                                     div().flex_1().min_h_0().child(
                                         Editor::new(&self.active_document().editor)
                                             .bordered(false)

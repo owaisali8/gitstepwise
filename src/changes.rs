@@ -643,14 +643,6 @@ impl ChangesView {
                         .on_click(cx.listener(|_, _, _, cx| cx.emit(ChangesEvent::Refresh))),
                 )
             })
-            .child(
-                Button::new("close-changes")
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::Close)
-                    .tooltip("Close")
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(ChangesEvent::Close))),
-            )
     }
 
     /// The files or edits, with their reviewed marks and the progress so far.
