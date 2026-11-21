@@ -7,6 +7,8 @@ edition = "2024"
 # Terminal emulation and the PTY (ConPTY on Windows) for the terminal panel.
 alacritty_terminal = "0.26"
 futures = "0.3"
+# Line diffs against the last Git commit, for the gutter and the Changes view.
+similar = "2"
 # Each tree-sitter-* feature adds syntax highlighting for one language.
 # JSON highlighting is built in. Add more from gpui-kit's feature list as needed.
 gpui-kit = { version = "0.9", features = [

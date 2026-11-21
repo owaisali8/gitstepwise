@@ -6,14 +6,22 @@
 //! A path that doesn't exist yet opens as a new, empty file at that path.
 
 mod explorer;
+mod git;
 mod terminal;
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
+use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::base::GlobalState;
 use gpui_kit::component::button::*;
-use gpui_kit::component::input::{self as edit, Editor, EditorState, InputEvent};
+use gpui_kit::component::diff::{Diff, DiffFile, DiffFileStatus, DiffMode, DiffSide, DiffState};
+use gpui_kit::component::input::{
+    self as edit, Editor, EditorState, GutterDecoration, GutterDecorationCollection, InputEvent,
+    OverviewRulerDecoration, OverviewRulerDecorationCollection, OverviewRulerLane, Position,
+};
 use gpui_kit::component::menu::AppMenuBar;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::*;
@@ -30,6 +38,7 @@ gpui_kit::actions!(
         OpenFile,
         OpenFolder,
         ToggleSidebar,
+        ToggleChanges,
         FocusExplorer,
         SaveFile,
         SaveFileAs,
@@ -50,6 +59,32 @@ const KEY_CONTEXT: &str = "TextEditor";
 const PLAIN_TEXT: &str = "text";
 const MIN_TERMINAL_HEIGHT: Pixels = px(80.);
 const MIN_SIDEBAR_WIDTH: Pixels = px(140.);
+/// How long typing pauses before the gutter's change markers update.
+const MARKER_DELAY: Duration = Duration::from_millis(150);
+/// How often to check the repository for commits, checkouts and staging.
+const REPO_POLL: Duration = Duration::from_millis(1500);
+
+// Icons beyond the kit's default set, embedded on top of it.
+gpui_kit::assets::icon_assets!(ExtraIcons, [GitBranch]);
+
+struct AppAssets;
+
+impl AssetSource for AppAssets {
+    fn load(&self, path: &str) -> gpui_kit::Result<Option<Cow<'static, [u8]>>> {
+        match ExtraIcons.load(path)? {
+            Some(bytes) => Ok(Some(bytes)),
+            None => gpui_kit::assets::Assets.load(path),
+        }
+    }
+
+    fn list(&self, path: &str) -> gpui_kit::Result<Vec<SharedString>> {
+        let mut paths = gpui_kit::assets::Assets.list(path)?;
+        paths.extend(ExtraIcons.list(path)?);
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+}
 
 /// File extensions, the highlighter's language id, and the name shown in the
 /// status bar. Each language needs its `tree-sitter-*` feature in Cargo.toml.
@@ -104,6 +139,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 #[derive(Clone, Copy, PartialEq)]
 struct MenuChecks {
     sidebar: bool,
+    changes: bool,
     terminal: bool,
     soft_wrap: bool,
     line_numbers: bool,
@@ -142,6 +178,7 @@ fn app_menus(checks: MenuChecks) -> Vec<Menu> {
         ]),
         Menu::new("View").items([
             MenuItem::action("Explorer", ToggleSidebar).checked(checks.sidebar),
+            MenuItem::action("Changes", ToggleChanges).checked(checks.changes),
             MenuItem::action("Terminal", ToggleTerminal).checked(checks.terminal),
             MenuItem::separator(),
             MenuItem::action("Word Wrap", ToggleSoftWrap).checked(checks.soft_wrap),
@@ -167,6 +204,14 @@ struct Document {
     dirty: bool,
     /// Cursor as 0-based (line, column), mirrored for the status bar.
     cursor: (u32, u32),
+    /// The file's text in the last commit, when it's committed to Git. The
+    /// gutter marks where the buffer differs from it.
+    base: Option<Arc<str>>,
+    markers: Vec<git::Marker>,
+    /// The gutter strip and scrollbar marks, created once the file has a base.
+    decorations: Option<(GutterDecorationCollection, OverviewRulerDecorationCollection)>,
+    _base_task: Option<Task<()>>,
+    _marker_task: Option<Task<()>>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -270,6 +315,21 @@ struct Workspace {
     menu_bar: Entity<AppMenuBar>,
     /// What the installed menus' check marks show; `None` before the first install.
     menu_checks: Option<MenuChecks>,
+    /// The Git repository of the explorer's folder, if it's in one.
+    repo: Option<git::Repo>,
+    /// Last seen modification times in `.git`, to notice commits and staging.
+    repo_stamp: Option<Vec<Option<SystemTime>>>,
+    branch: Option<SharedString>,
+    changed_files: usize,
+    /// Every changed file in the repository, shown in place of the editor.
+    changes: Entity<DiffState>,
+    changes_visible: bool,
+    changes_loaded: bool,
+    /// The file to scroll the Changes view to once it has loaded.
+    changes_scroll_to: Option<String>,
+    _repo_task: Option<Task<()>>,
+    _changes_task: Option<Task<()>>,
+    _repo_watch: Task<()>,
     _terminal_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -299,9 +359,28 @@ impl Workspace {
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.explorer.update(cx, |explorer, cx| explorer.refresh(cx));
+                    // Files may have been committed or changed elsewhere too.
+                    this.refresh_git(cx);
+                }
+            }),
+            // The gutter's marker colors come from the theme.
+            cx.observe_global::<Theme>(|this, cx| {
+                for ix in 0..this.documents.len() {
+                    this.paint_markers(ix, cx);
                 }
             }),
         ];
+        let changes = cx.new(|cx| DiffState::new(Vec::new(), cx));
+        // Notice commits, checkouts and staging done outside the editor, or
+        // in its terminal.
+        let repo_watch = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(REPO_POLL).await;
+                if this.update(cx, |this, cx| this.check_repo(cx)).is_err() {
+                    break;
+                }
+            }
+        });
 
         let mut this = Self {
             documents: Vec::new(),
@@ -320,6 +399,17 @@ impl Workspace {
             fps: FpsMeter::from_env(),
             menu_bar: AppMenuBar::new(cx),
             menu_checks: None,
+            repo: None,
+            repo_stamp: None,
+            branch: None,
+            changed_files: 0,
+            changes,
+            changes_visible: false,
+            changes_loaded: false,
+            changes_scroll_to: None,
+            _repo_task: None,
+            _changes_task: None,
+            _repo_watch: repo_watch,
             _terminal_subscription: None,
             _subscriptions: subscriptions,
         };
@@ -334,6 +424,7 @@ impl Workspace {
 
         this.install_close_guard(window, cx);
         this.activate(this.active, window, cx);
+        this.refresh_repo(cx);
         this
     }
 
@@ -362,6 +453,7 @@ impl Workspace {
         self.explorer
             .update(cx, |explorer, cx| explorer.set_root(folder, cx));
         self.sidebar_visible = true;
+        self.refresh_repo(cx);
         cx.notify();
     }
 
@@ -444,8 +536,14 @@ impl Workspace {
             path,
             dirty: false,
             cursor: (0, 0),
+            base: None,
+            markers: Vec::new(),
+            decorations: None,
+            _base_task: None,
+            _marker_task: None,
             _subscriptions: subscriptions,
         });
+        self.load_base(id, cx);
         self.documents.len() - 1
     }
 
@@ -467,6 +565,8 @@ impl Workspace {
         doc.path = Some(path);
         doc.dirty = false;
         doc.cursor = (0, 0);
+        let id = doc.id;
+        self.load_base(id, cx);
     }
 
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -474,6 +574,8 @@ impl Workspace {
             return;
         }
         self.active = ix;
+        // Switching to a file leaves the Changes view.
+        self.changes_visible = false;
         self.focus_active(window, cx);
         self.update_title(window);
         self.sync_explorer(cx);
@@ -575,6 +677,8 @@ impl Workspace {
                 self.update_title(window);
             }
         }
+        let id = self.documents[ix].id;
+        self.schedule_markers(id, MARKER_DELAY, cx);
         cx.notify();
     }
 
@@ -610,6 +714,7 @@ impl Workspace {
     fn sync_menus(&mut self, cx: &mut Context<Self>) {
         let checks = MenuChecks {
             sidebar: self.sidebar_visible,
+            changes: self.changes_visible,
             terminal: self.terminal_visible,
             soft_wrap: self.soft_wrap,
             line_numbers: self.line_numbers,
@@ -661,6 +766,9 @@ impl Workspace {
         // A "Save As" may have created a file the explorer should list.
         self.explorer.update(cx, |explorer, cx| explorer.refresh(cx));
         self.sync_explorer(cx);
+        // A "Save As" may also have moved the file in or out of Git.
+        self.load_base(id, cx);
+        self.refresh_changes(cx);
         true
     }
 
@@ -792,6 +900,282 @@ impl Workspace {
                 false
             })
         });
+    }
+
+    // ---- Git ---------------------------------------------------------------
+
+    /// Find the repository of the explorer's folder (or else the active
+    /// file's), then load its changes.
+    fn refresh_repo(&mut self, cx: &mut Context<Self>) {
+        let mut folders = vec![self.default_folder(cx)];
+        if let Some(folder) = self
+            .documents
+            .get(self.active)
+            .and_then(|doc| doc.path.as_deref())
+            .and_then(Path::parent)
+        {
+            folders.push(folder.to_path_buf());
+        }
+        self._repo_task = Some(cx.spawn(async move |this, cx| {
+            let repo = cx
+                .background_spawn(async move { folders.iter().find_map(|folder| git::Repo::find(folder)) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.repo != repo {
+                    this.repo_stamp = repo.as_ref().map(git::Repo::stamp);
+                    this.repo = repo;
+                    this.changes_loaded = false;
+                }
+                this.refresh_changes(cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Reload everything when `.git` shows a commit, checkout or staging.
+    fn check_repo(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = &self.repo else {
+            return;
+        };
+        let stamp = Some(repo.stamp());
+        if self.repo_stamp != stamp {
+            self.repo_stamp = stamp;
+            self.refresh_git(cx);
+        }
+    }
+
+    /// Re-read every open file's committed version, and the changed files.
+    fn refresh_git(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<DocId> = self.documents.iter().map(|doc| doc.id).collect();
+        for id in ids {
+            self.load_base(id, cx);
+        }
+        self.refresh_changes(cx);
+    }
+
+    /// Read a document's committed version in the background, then mark
+    /// where the buffer differs from it.
+    fn load_base(&mut self, id: DocId, cx: &mut Context<Self>) {
+        let Some(ix) = self.index_of(id) else {
+            return;
+        };
+        let doc = &mut self.documents[ix];
+        let Some(path) = doc.path.clone() else {
+            self.set_base(id, None, cx);
+            return;
+        };
+        doc._base_task = Some(cx.spawn(async move |this, cx| {
+            let base = cx
+                .background_spawn(async move { git::committed_text(&path) })
+                .await;
+            this.update(cx, |this, cx| this.set_base(id, base.map(Arc::from), cx))
+                .ok();
+        }));
+    }
+
+    fn set_base(&mut self, id: DocId, base: Option<Arc<str>>, cx: &mut Context<Self>) {
+        let Some(ix) = self.index_of(id) else {
+            return;
+        };
+        let doc = &mut self.documents[ix];
+        if base.is_none() {
+            // Not committed: no gutter strip at all.
+            doc.base = None;
+            doc.markers.clear();
+            doc._marker_task = None;
+            if let Some((gutter, ruler)) = doc.decorations.take() {
+                gutter.dispose(cx);
+                ruler.dispose(cx);
+            }
+            return;
+        }
+        doc.base = base;
+        if doc.decorations.is_none() {
+            doc.decorations = Some(doc.editor.update(cx, |state, cx| {
+                (
+                    state.create_gutter_decorations_collection(Vec::new(), cx),
+                    state.create_overview_ruler_decorations_collection(Vec::new(), cx),
+                )
+            }));
+        }
+        self.schedule_markers(id, Duration::ZERO, cx);
+    }
+
+    /// Diff the buffer against its committed version after `delay`, off the
+    /// main thread. A newer call replaces a pending one.
+    fn schedule_markers(&mut self, id: DocId, delay: Duration, cx: &mut Context<Self>) {
+        let Some(ix) = self.index_of(id) else {
+            return;
+        };
+        let doc = &mut self.documents[ix];
+        let Some(base) = doc.base.clone() else {
+            return;
+        };
+        doc._marker_task = Some(cx.spawn(async move |this, cx| {
+            if !delay.is_zero() {
+                cx.background_executor().timer(delay).await;
+            }
+            let Ok(Some(text)) = this.update(cx, |this, cx| {
+                let ix = this.index_of(id)?;
+                Some(this.documents[ix].editor.read(cx).value().to_string())
+            }) else {
+                return;
+            };
+            let markers = cx
+                .background_spawn(async move { git::markers(&base, &text) })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Some(ix) = this.index_of(id) {
+                    this.documents[ix].markers = markers;
+                    this.paint_markers(ix, cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Draw a document's markers in its gutter and on its scrollbar: green for
+    /// added lines, blue for modified ones, red where lines were deleted.
+    fn paint_markers(&self, ix: usize, cx: &mut Context<Self>) {
+        let doc = &self.documents[ix];
+        let Some((gutter, ruler)) = &doc.decorations else {
+            return;
+        };
+        let theme = cx.theme();
+        let (added, modified, deleted) = (theme.success, theme.info, theme.danger);
+        let color = |kind| match kind {
+            git::MarkerKind::Added => added,
+            git::MarkerKind::Modified => modified,
+            git::MarkerKind::Deleted => deleted,
+        };
+        let gutter_marks = doc
+            .markers
+            .iter()
+            .map(|marker| GutterDecoration::new(marker.range.clone()).with_color(color(marker.kind)))
+            .collect();
+        let ruler_marks = doc
+            .markers
+            .iter()
+            .map(|marker| {
+                OverviewRulerDecoration::new(marker.range.clone())
+                    .with_lane(OverviewRulerLane::Left)
+                    .with_color(color(marker.kind))
+            })
+            .collect();
+        gutter.set(gutter_marks, cx);
+        ruler.set(ruler_marks, cx);
+    }
+
+    /// Reload the branch and the list of changed files. The diffs themselves
+    /// are only built while the Changes view is showing.
+    fn refresh_changes(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else {
+            self.branch = None;
+            self.changed_files = 0;
+            self.changes_loaded = true;
+            self.changes.update(cx, |state, cx| state.set_files(Vec::new(), cx));
+            cx.notify();
+            return;
+        };
+        // Unsaved edits count as changes, as they do in the gutter.
+        let unsaved: Vec<(PathBuf, String)> = self
+            .documents
+            .iter()
+            .filter(|doc| doc.dirty)
+            .filter_map(|doc| Some((doc.path.clone()?, doc.editor.read(cx).value().to_string())))
+            .collect();
+        let with_diffs = self.changes_visible;
+
+        self._changes_task = Some(cx.spawn(async move |this, cx| {
+            let (branch, count, patch) = cx
+                .background_spawn(async move {
+                    let unsaved: Vec<(String, String)> = unsaved
+                        .into_iter()
+                        .filter_map(|(path, text)| Some((repo.relative(&path)?, text)))
+                        .collect();
+                    let mut paths = repo.changed_paths();
+                    paths.extend(unsaved.iter().map(|(path, _)| path.clone()));
+                    paths.sort();
+                    paths.dedup();
+                    let patch = with_diffs.then(|| {
+                        paths
+                            .iter()
+                            .filter_map(|path| {
+                                let current = match unsaved.iter().find(|(unsaved, _)| unsaved == path) {
+                                    Some((_, text)) => Some(text.clone().into_bytes()),
+                                    None => std::fs::read(repo.root.join(path)).ok(),
+                                };
+                                git::file_patch(path, repo.committed_bytes(path), current)
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    let count = patch.as_ref().map_or(paths.len(), Vec::len);
+                    (repo.branch(), count, patch.map(|patches| patches.concat()))
+                })
+                .await;
+
+            this.update(cx, |this, cx| {
+                this.branch = branch.map(SharedString::from);
+                this.changed_files = count;
+                if let Some(patch) = patch {
+                    let files = match DiffFile::parse(&patch) {
+                        Ok(files) => files,
+                        Err(err) => {
+                            this.set_status(format!("Couldn't read the changes: {}", err.message()), true, cx);
+                            Vec::new()
+                        }
+                    };
+                    let scroll_to = this.changes_scroll_to.take();
+                    this.changes.update(cx, |state, cx| {
+                        state.set_files(files, cx);
+                        if let Some(path) = scroll_to {
+                            state.scroll_to_file(&path, cx);
+                        }
+                    });
+                    this.changes_loaded = true;
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Show or hide every change since the last commit, in place of the editor.
+    fn toggle_changes(&mut self, _: &ToggleChanges, window: &mut Window, cx: &mut Context<Self>) {
+        if self.changes_visible {
+            self.changes_visible = false;
+            self.focus_active(window, cx);
+            cx.notify();
+            return;
+        }
+        self.changes_visible = true;
+        // Start at the file being edited.
+        self.changes_scroll_to = self.repo.as_ref().and_then(|repo| {
+            let path = self.documents.get(self.active)?.path.as_deref()?;
+            repo.relative(path)
+        });
+        self.refresh_changes(cx);
+        self.changes.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn set_diff_mode(&mut self, mode: DiffMode, cx: &mut Context<Self>) {
+        self.changes.update(cx, |state, cx| state.set_mode(mode, cx));
+    }
+
+    /// Open a file from the Changes view, at a 1-based line if given.
+    fn open_at(&mut self, path: PathBuf, line: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_path(path.clone(), window, cx);
+        let Some(line) = line else {
+            return;
+        };
+        let doc = self.active_document();
+        if doc.path.as_deref().is_some_and(|open| same_file(open, &path)) {
+            let position = Position::new(line.saturating_sub(1) as u32, 0);
+            doc.editor
+                .clone()
+                .update(cx, |state, cx| state.set_cursor_position(position, window, cx));
+        }
     }
 
     // ---- Terminal ----------------------------------------------------------
@@ -1005,6 +1389,181 @@ impl Workspace {
             }))
     }
 
+    /// Every change since the last commit, one file after another, in place
+    /// of the tabs and the editor.
+    fn render_changes(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (muted, border, success, danger) = (
+            theme.muted_foreground,
+            theme.border,
+            theme.success,
+            theme.danger,
+        );
+        let state = self.changes.read(cx);
+        let files = state.files();
+        let mode = state.mode();
+        let (additions, deletions) = files
+            .iter()
+            .fold((0, 0), |(a, d), file| (a + file.additions(), d + file.deletions()));
+        let summary = match files.len() {
+            0 => String::new(),
+            1 => "1 changed file".into(),
+            n => format!("{n} changed files"),
+        };
+        let has_files = !files.is_empty();
+
+        let message = |text: &str| {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(muted)
+                .child(text.to_string())
+                .into_any_element()
+        };
+        let body = match &self.repo {
+            None => message("The folder in the explorer isn't in a Git repository."),
+            Some(_) if !self.changes_loaded => message("Loading changes…"),
+            Some(_) if !has_files => message("No changes since the last commit."),
+            Some(repo) => {
+                let workspace = cx.weak_entity();
+                let root = repo.root.clone();
+                let open_button = {
+                    let (workspace, root) = (workspace.clone(), root.clone());
+                    move |file: &DiffFile, _: &mut Window, _: &mut App| {
+                        let path = root.join(file.path().to_string());
+                        let workspace = workspace.clone();
+                        div().when(file.status() != DiffFileStatus::Deleted, |this| {
+                            this.child(
+                                Button::new(SharedString::from(format!("open:{}", file.path())))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::ExternalLink)
+                                    .label("Open")
+                                    .on_click(move |_, window, cx| {
+                                        workspace
+                                            .update(cx, |this, cx| this.open_path(path.clone(), window, cx))
+                                            .ok();
+                                    }),
+                            )
+                        })
+                    }
+                };
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        Diff::new(&self.changes)
+                            .size_full()
+                            .soft_wrap(self.soft_wrap)
+                            .header_suffix(open_button)
+                            // Double-click a line to edit the file there.
+                            .on_line_click(move |position, event, window, cx| {
+                                if event.click_count() < 2 {
+                                    return;
+                                }
+                                let path = root.join(position.path().to_string());
+                                let line = (position.side() == DiffSide::Modified).then(|| position.line());
+                                workspace
+                                    .update(cx, |this, cx| this.open_at(path, line, window, cx))
+                                    .ok();
+                            }),
+                    )
+                    .into_any_element()
+            }
+        };
+
+        let mode_button = |id: &'static str, label: &'static str, value: DiffMode| {
+            Button::new(id)
+                .ghost()
+                .xsmall()
+                .label(label)
+                .selected(mode == value)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_diff_mode(value, cx)))
+        };
+
+        div()
+            .v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(
+                div()
+                    .h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .pl_3()
+                    .pr_1()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(border)
+                    .text_xs()
+                    .text_color(muted)
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("CHANGES"))
+                    .when_some(self.branch.clone(), |row, branch| {
+                        row.child(
+                            div()
+                                .h_flex()
+                                .items_center()
+                                .gap_1()
+                                .child(Icon::new(LucideIcon::GitBranch).xsmall())
+                                .child(branch),
+                        )
+                    })
+                    .child(summary)
+                    .when(has_files, |row| {
+                        row.child(div().text_color(success).child(format!("+{additions}")))
+                            .child(div().text_color(danger).child(format!("−{deletions}")))
+                    })
+                    .child(div().flex_1())
+                    .child(mode_button("diff-unified", "Unified", DiffMode::Unified))
+                    .child(mode_button("diff-split", "Split", DiffMode::Split))
+                    .child(
+                        Button::new("previous-change")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::ArrowUp)
+                            .tooltip("Previous change")
+                            .disabled(!has_files)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.changes.update(cx, |state, cx| state.previous_change(cx))
+                            })),
+                    )
+                    .child(
+                        Button::new("next-change")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::ArrowDown)
+                            .tooltip("Next change")
+                            .disabled(!has_files)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.changes.update(cx, |state, cx| state.next_change(cx))
+                            })),
+                    )
+                    .child(
+                        Button::new("refresh-changes")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::RefreshCw)
+                            .tooltip("Refresh")
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh_git(cx))),
+                    )
+                    .child(
+                        Button::new("close-changes")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip(format!("Close ({})", shortcut("Shift+G")))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_changes(&ToggleChanges, window, cx)
+                            })),
+                    ),
+            )
+            .child(body)
+    }
+
     fn render_terminal_panel(&self, terminal: &Entity<TerminalView>, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let title = terminal.read(cx).title().unwrap_or_else(|| "Shell".into());
@@ -1107,7 +1666,37 @@ impl Workspace {
             .border_t_1()
             .border_color(theme.status_bar_border)
             .text_color(theme.muted_foreground)
-            .child(div().min_w_0().truncate().text_color(message_color).child(message))
+            .child(
+                div()
+                    .h_flex()
+                    .min_w_0()
+                    .items_center()
+                    .gap_4()
+                    // The branch, and how many files changed; click for the Changes view.
+                    .when_some(self.branch.clone(), |row, branch| {
+                        let changed = match self.changed_files {
+                            0 => String::new(),
+                            1 => " · 1 change".into(),
+                            n => format!(" · {n} changes"),
+                        };
+                        row.child(
+                            div()
+                                .id("git-status")
+                                .h_flex()
+                                .flex_none()
+                                .items_center()
+                                .gap_1()
+                                .cursor_pointer()
+                                .hover(|style| style.text_color(theme.foreground))
+                                .child(Icon::new(LucideIcon::GitBranch).xsmall())
+                                .child(format!("{branch}{changed}"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_changes(&ToggleChanges, window, cx)
+                                })),
+                        )
+                    })
+                    .child(div().min_w_0().truncate().text_color(message_color).child(message)),
+            )
             .child(
                 div()
                     .h_flex()
@@ -1195,6 +1784,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::toggle_changes))
             .on_action(cx.listener(Self::focus_explorer))
             .on_action(cx.listener(Self::save_file))
             .on_action(cx.listener(Self::save_file_as))
@@ -1255,14 +1845,18 @@ impl Render for Workspace {
                             .flex_1()
                             .min_w_0()
                             .h_full()
-                            .child(self.render_tab_bar(cx))
-                            .child(
-                                div().flex_1().min_h_0().child(
-                                    Editor::new(&self.active_document().editor)
-                                        .bordered(false)
-                                        .size_full(),
-                                ),
-                            )
+                            .map(|column| {
+                                if self.changes_visible {
+                                    return column.child(self.render_changes(cx));
+                                }
+                                column.child(self.render_tab_bar(cx)).child(
+                                    div().flex_1().min_h_0().child(
+                                        Editor::new(&self.active_document().editor)
+                                            .bordered(false)
+                                            .size_full(),
+                                    ),
+                                )
+                            })
                             .when_some(terminal, |this, terminal| {
                                 this.child(self.render_terminal_panel(&terminal, cx))
                             }),
@@ -1294,6 +1888,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(primary!("o"), OpenFile, context),
         KeyBinding::new(concat!(primary!("k"), " ", primary!("o")), OpenFolder, context),
         KeyBinding::new(primary!("b"), ToggleSidebar, context),
+        KeyBinding::new(primary!("shift-g"), ToggleChanges, context),
         KeyBinding::new(primary!("shift-e"), FocusExplorer, context),
         KeyBinding::new(primary!("s"), SaveFile, context),
         KeyBinding::new(primary!("shift-s"), SaveFileAs, context),
@@ -1314,7 +1909,7 @@ fn main() {
     let paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
 
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
             bind_keys(cx);

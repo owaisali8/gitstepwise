@@ -2136,6 +2136,7 @@ dependencies = [
  "alacritty_terminal",
  "futures",
  "gpui-kit",
+ "similar",
 ]
 
 [[package]]
