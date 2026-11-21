@@ -53,6 +53,9 @@ gpui_kit::actions!(
         ToggleTerminal,
         ToggleSoftWrap,
         ToggleLineNumbers,
+        ZoomIn,
+        ZoomOut,
+        ResetZoom,
         UseLightTheme,
         UseDarkTheme,
         Quit,
@@ -68,9 +71,13 @@ const MIN_SIDEBAR_WIDTH: Pixels = px(140.);
 const MARKER_DELAY: Duration = Duration::from_millis(150);
 /// How often to check the repository for commits, checkouts and staging.
 const REPO_POLL: Duration = Duration::from_millis(1500);
+/// The editor's font size limits, and how much each zoom step changes it.
+const MIN_FONT_SIZE: Pixels = px(8.);
+const MAX_FONT_SIZE: Pixels = px(40.);
+const FONT_SIZE_STEP: Pixels = px(1.);
 
 // Icons beyond the kit's default set, embedded on top of it.
-gpui_kit::assets::icon_assets!(ExtraIcons, [Circle, GitBranch]);
+gpui_kit::assets::icon_assets!(ExtraIcons, [Circle, FilePlus, GitBranch]);
 
 struct AppAssets;
 
@@ -191,6 +198,10 @@ fn app_menus(checks: MenuChecks) -> Vec<Menu> {
             MenuItem::action("Word Wrap", ToggleSoftWrap).checked(checks.soft_wrap),
             MenuItem::action("Line Numbers", ToggleLineNumbers).checked(checks.line_numbers),
             MenuItem::separator(),
+            MenuItem::action("Zoom In", ZoomIn),
+            MenuItem::action("Zoom Out", ZoomOut),
+            MenuItem::action("Reset Zoom", ResetZoom),
+            MenuItem::separator(),
             MenuItem::action("Light Theme", UseLightTheme).checked(!checks.dark),
             MenuItem::action("Dark Theme", UseDarkTheme).checked(checks.dark),
         ]),
@@ -305,11 +316,16 @@ enum Resize {
 }
 
 struct Workspace {
+    /// The open files. Can be empty: closing the last tab leaves none.
     documents: Vec<Document>,
     active: usize,
     next_id: DocId,
     soft_wrap: bool,
     line_numbers: bool,
+    /// The editor's font size, set by zooming; `None` uses the theme's.
+    font_size: Option<Pixels>,
+    /// Holds focus when no file is open, so the shortcuts keep working.
+    focus_handle: FocusHandle,
     status: Option<Status>,
     explorer: Entity<Explorer>,
     sidebar_visible: bool,
@@ -397,6 +413,8 @@ impl Workspace {
             next_id: 0,
             soft_wrap: true,
             line_numbers: true,
+            font_size: None,
+            focus_handle: cx.focus_handle(),
             status: None,
             explorer,
             sidebar_visible: true,
@@ -510,8 +528,10 @@ impl Workspace {
         self.documents.iter().position(|doc| doc.id == id)
     }
 
-    fn active_document(&self) -> &Document {
-        &self.documents[self.active]
+    /// The file showing (or last shown, under the Changes tab); `None` when
+    /// no file is open.
+    fn active_document(&self) -> Option<&Document> {
+        self.documents.get(self.active)
     }
 
     /// Add a tab for `text` and return its index (it isn't activated).
@@ -585,6 +605,12 @@ impl Workspace {
         self.active = ix;
         // Switching to a file leaves the Changes tab open but not showing.
         self.changes_active = false;
+        self.show_active(window, cx);
+    }
+
+    /// Bring focus, the title and the explorer's highlight in line with the
+    /// tab showing.
+    fn show_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_active(window, cx);
         self.update_title(window);
         self.sync_explorer(cx);
@@ -613,14 +639,20 @@ impl Workspace {
         }
     }
 
-    /// Focus what the main area shows: the active editor, or the Changes view.
+    /// Focus what the main area shows: the active editor, the Changes view,
+    /// or the empty area when no file is open.
     fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
         if self.changes_active {
             self.changes.read(cx).focus_handle(cx).focus(window, cx);
             return;
         }
-        let editor = self.active_document().editor.clone();
-        editor.update(cx, |state, cx| state.focus(window, cx));
+        match self.active_document() {
+            Some(doc) => {
+                let editor = doc.editor.clone();
+                editor.update(cx, |state, cx| state.focus(window, cx));
+            }
+            None => self.focus_handle.focus(window, cx),
+        }
     }
 
     /// Open a file in a tab, or switch to it if it's already open. A folder
@@ -669,7 +701,8 @@ impl Workspace {
         }
     }
 
-    /// Close a tab, asking first if it has unsaved changes.
+    /// Close a tab, asking first if it has unsaved changes. Closing the last
+    /// one leaves the Changes tab, if it's open, or else no tabs at all.
     fn close_document(&mut self, id: DocId, window: &mut Window, cx: &mut Context<Self>) {
         self.confirm_discard(
             id,
@@ -680,15 +713,18 @@ impl Workspace {
                     return;
                 };
                 this.documents.remove(ix);
-                if this.documents.is_empty() {
-                    this.add_document(None, String::new(), window, cx);
+                if ix < this.active {
+                    this.active -= 1;
                 }
-                let active = if ix < this.active {
-                    this.active - 1
+                this.active = this.active.min(this.documents.len().saturating_sub(1));
+                if this.changes_active {
+                    // A file closed behind the Changes tab: it stays showing.
+                    cx.notify();
+                } else if this.documents.is_empty() && this.changes_open {
+                    this.show_changes(None, window, cx);
                 } else {
-                    this.active.min(this.documents.len() - 1)
-                };
-                this.activate(active, window, cx);
+                    this.show_active(window, cx);
+                }
             }),
         );
     }
@@ -1263,7 +1299,9 @@ impl Workspace {
         let Some(line) = line else {
             return;
         };
-        let doc = self.active_document();
+        let Some(doc) = self.active_document() else {
+            return;
+        };
         if doc.path.as_deref().is_some_and(|open| same_file(open, &path)) {
             let position = Position::new(line.saturating_sub(1) as u32, 0);
             doc.editor
@@ -1286,8 +1324,7 @@ impl Workspace {
             // Start in the active file's folder, else the explorer's.
             let working_directory = self
                 .active_document()
-                .path
-                .as_deref()
+                .and_then(|doc| doc.path.as_deref())
                 .and_then(Path::parent)
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| self.default_folder(cx));
@@ -1364,13 +1401,15 @@ impl Workspace {
     }
 
     fn save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
-        let id = self.active_document().id;
-        self.save_document(id, false, None, window, cx);
+        if let Some(id) = self.active_document().map(|doc| doc.id) {
+            self.save_document(id, false, None, window, cx);
+        }
     }
 
     fn save_file_as(&mut self, _: &SaveFileAs, window: &mut Window, cx: &mut Context<Self>) {
-        let id = self.active_document().id;
-        self.save_document(id, true, None, window, cx);
+        if let Some(id) = self.active_document().map(|doc| doc.id) {
+            self.save_document(id, true, None, window, cx);
+        }
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -1378,8 +1417,9 @@ impl Workspace {
             self.close_changes(window, cx);
             return;
         }
-        let id = self.active_document().id;
-        self.close_document(id, window, cx);
+        if let Some(id) = self.active_document().map(|doc| doc.id) {
+            self.close_document(id, window, cx);
+        }
     }
 
     /// How many tabs there are: the files, and the Changes tab if it's open.
@@ -1388,12 +1428,19 @@ impl Workspace {
     }
 
     fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
-        let ix = (self.active_tab_index() + 1) % self.tab_count();
+        let count = self.tab_count();
+        if count == 0 {
+            return;
+        }
+        let ix = (self.active_tab_index() + 1) % count;
         self.select_tab(ix, window, cx);
     }
 
     fn previous_tab(&mut self, _: &PreviousTab, window: &mut Window, cx: &mut Context<Self>) {
         let count = self.tab_count();
+        if count == 0 {
+            return;
+        }
         let ix = (self.active_tab_index() + count - 1) % count;
         self.select_tab(ix, window, cx);
     }
@@ -1425,6 +1472,33 @@ impl Workspace {
         }
         self.focus_active(window, cx);
         cx.notify();
+    }
+
+    /// The editor's font size: the zoomed one, else the theme's code size.
+    fn editor_font_size(&self, cx: &App) -> Pixels {
+        self.font_size.unwrap_or(cx.theme().mono_font_size)
+    }
+
+    /// Change the editor's font size (in every tab) by `delta`, or back to
+    /// the theme's with `None`.
+    fn zoom(&mut self, delta: Option<Pixels>, cx: &mut Context<Self>) {
+        self.font_size = delta.map(|delta| {
+            (self.editor_font_size(cx) + delta).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+        });
+        let size = f32::from(self.editor_font_size(cx));
+        self.set_status(format!("Font size {size} px"), false, cx);
+    }
+
+    fn zoom_in(&mut self, _: &ZoomIn, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom(Some(FONT_SIZE_STEP), cx);
+    }
+
+    fn zoom_out(&mut self, _: &ZoomOut, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom(Some(-FONT_SIZE_STEP), cx);
+    }
+
+    fn reset_zoom(&mut self, _: &ResetZoom, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom(None, cx);
     }
 
     fn use_light_theme(&mut self, _: &UseLightTheme, window: &mut Window, cx: &mut Context<Self>) {
@@ -1548,6 +1622,53 @@ impl Workspace {
             .children(changes_tab)
     }
 
+    /// What the main area shows once every tab is closed. It holds focus, so
+    /// the shortcuts and menus still reach the workspace.
+    fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let action = |id: &'static str, label: &'static str, keys: &str| {
+            Button::new(id)
+                .ghost()
+                .small()
+                .label(label)
+                .tooltip(keys.to_string())
+        };
+
+        div()
+            .id("empty-state")
+            .track_focus(&self.focus_handle)
+            .flex_1()
+            .min_h_0()
+            .v_flex()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .text_sm()
+            .text_color(muted)
+            .child("No file is open")
+            .child(
+                div()
+                    .h_flex()
+                    .gap_1()
+                    .child(
+                        action("empty-new-file", "New File", &shortcut("N"))
+                            .on_click(cx.listener(|this, _, window, cx| this.new_file(&NewFile, window, cx))),
+                    )
+                    .child(
+                        action("empty-open-file", "Open File…", &shortcut("O"))
+                            .on_click(cx.listener(|this, _, window, cx| this.open_file(&OpenFile, window, cx))),
+                    )
+                    .child(
+                        action(
+                            "empty-open-folder",
+                            "Open Folder…",
+                            &format!("{} {}", shortcut("K"), shortcut("O")),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.open_folder(&OpenFolder, window, cx))),
+                    ),
+            )
+    }
+
     fn render_terminal_panel(&self, terminal: &Entity<TerminalView>, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let title = terminal.read(cx).title().unwrap_or_else(|| "Shell".into());
@@ -1622,18 +1743,29 @@ impl Workspace {
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let doc = self.active_document();
-        let state = doc.editor.read(cx);
-        let line_count = state.text().lines_len();
-        let language = language_label(&state.language_name());
+        // The cursor, line count, language and encoding, for an open file.
+        let file_info = doc.map(|doc| {
+            let state = doc.editor.read(cx);
+            let line_count = state.text().lines_len();
+            [
+                format!("Ln {}, Col {}", doc.cursor.0 + 1, doc.cursor.1 + 1),
+                format!("{line_count} {}", if line_count == 1 { "line" } else { "lines" }),
+                language_label(&state.language_name()).to_string(),
+                "UTF-8".to_string(),
+            ]
+        });
 
         let (message, message_color) = match &self.status {
             Some(status) if status.is_error => (status.message.clone(), theme.danger),
             Some(status) => (status.message.clone(), theme.muted_foreground),
             None => {
-                let location = doc
-                    .path
-                    .as_deref()
-                    .map_or_else(|| "Untitled".into(), |path| path.display().to_string());
+                let location = match doc {
+                    Some(doc) => doc
+                        .path
+                        .as_deref()
+                        .map_or_else(|| "Untitled".into(), |path| path.display().to_string()),
+                    None => String::new(),
+                };
                 (location.into(), theme.muted_foreground)
             }
         };
@@ -1687,13 +1819,7 @@ impl Workspace {
                     .flex_none()
                     .gap_4()
                     .when_some(self.fps.as_ref(), |row, meter| row.child(meter.label()))
-                    .child(format!("Ln {}, Col {}", doc.cursor.0 + 1, doc.cursor.1 + 1))
-                    .child(format!(
-                        "{line_count} {}",
-                        if line_count == 1 { "line" } else { "lines" }
-                    ))
-                    .child(language)
-                    .child("UTF-8"),
+                    .children(file_info.into_iter().flatten()),
             )
     }
 }
@@ -1780,6 +1906,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::toggle_soft_wrap))
             .on_action(cx.listener(Self::toggle_line_numbers))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::reset_zoom))
             .on_action(cx.listener(Self::use_light_theme))
             .on_action(cx.listener(Self::use_dark_theme))
             .on_action(cx.listener(Self::quit))
@@ -1837,10 +1966,14 @@ impl Render for Workspace {
                                     return column
                                         .child(div().flex_1().min_h_0().child(self.changes.clone()));
                                 }
+                                let Some(doc) = self.active_document() else {
+                                    return column.child(self.render_empty_state(cx));
+                                };
                                 column.child(
                                     div().flex_1().min_h_0().child(
-                                        Editor::new(&self.active_document().editor)
+                                        Editor::new(&doc.editor)
                                             .bordered(false)
+                                            .text_size(self.editor_font_size(cx))
                                             .size_full(),
                                     ),
                                 )
@@ -1887,6 +2020,13 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(primary!("pageup"), PreviousTab, context),
         KeyBinding::new("ctrl-`", ToggleTerminal, context),
         KeyBinding::new("alt-z", ToggleSoftWrap, context),
+        // Ctrl+= and Ctrl++ (with or without Shift, on the main row's = key).
+        // The menu shows the last binding, so plain Ctrl+= comes last.
+        KeyBinding::new(primary!("+"), ZoomIn, context),
+        KeyBinding::new(primary!("shift-="), ZoomIn, context),
+        KeyBinding::new(primary!("="), ZoomIn, context),
+        KeyBinding::new(primary!("-"), ZoomOut, context),
+        KeyBinding::new(primary!("0"), ResetZoom, context),
         KeyBinding::new(primary!("q"), Quit, context),
     ]);
     terminal::bind_keys(cx);

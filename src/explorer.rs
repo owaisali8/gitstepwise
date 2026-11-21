@@ -3,9 +3,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
+use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::button::*;
+use gpui_kit::component::input::{self, Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -60,6 +62,18 @@ struct Entry {
     path: PathBuf,
     is_dir: bool,
     depth: usize,
+    /// The row with the new file's name field, first in its folder.
+    new_file: bool,
+}
+
+/// A file being named, before it's created.
+struct NewFile {
+    /// The folder it goes in.
+    dir: PathBuf,
+    input: Entity<InputState>,
+    /// Why the last name didn't work, shown above the tree.
+    error: Option<SharedString>,
+    _subscription: Subscription,
 }
 
 pub struct Explorer {
@@ -73,6 +87,7 @@ pub struct Explorer {
     selected: Option<PathBuf>,
     /// The file in the active tab, highlighted.
     active_file: Option<PathBuf>,
+    new_file: Option<NewFile>,
     scroll: UniformListScrollHandle,
     focus_handle: FocusHandle,
 }
@@ -94,6 +109,7 @@ impl Explorer {
             entries: Vec::new(),
             selected: None,
             active_file: None,
+            new_file: None,
             scroll: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
         };
@@ -111,6 +127,7 @@ impl Explorer {
         self.expanded.clear();
         self.listings.clear();
         self.selected = None;
+        self.new_file = None;
         self.rebuild();
         if let Some(active) = self.active_file.clone() {
             self.reveal(&active);
@@ -159,8 +176,109 @@ impl Explorer {
 
     pub fn collapse_all(&mut self, cx: &mut Context<Self>) {
         self.expanded.clear();
+        self.new_file = None;
         self.rebuild();
         cx.notify();
+    }
+
+    // ---- New file ----------------------------------------------------------
+
+    /// Show a name field for a new file: in the selected folder, else the
+    /// selected file's folder, else the root. Enter creates and opens it;
+    /// Escape or clicking elsewhere cancels.
+    pub fn start_new_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = self.target_folder();
+        if dir != self.root {
+            self.reveal(&dir);
+            self.expanded.insert(dir.clone());
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("File name"));
+        let subscription = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
+            match event {
+                InputEvent::PressEnter { .. } => this.create_new_file(window, cx),
+                InputEvent::Blur => this.cancel_new_file(cx),
+                InputEvent::Change => {
+                    if let Some(new_file) = &mut this.new_file {
+                        if new_file.error.take().is_some() {
+                            cx.notify();
+                        }
+                    }
+                }
+                InputEvent::Focus => {}
+            }
+        });
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.new_file = Some(NewFile {
+            dir,
+            input,
+            error: None,
+            _subscription: subscription,
+        });
+        self.rebuild();
+        if let Some(ix) = self.entries.iter().position(|entry| entry.new_file) {
+            self.scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
+        }
+        cx.notify();
+    }
+
+    /// Where a new file goes, given the selection.
+    fn target_folder(&self) -> PathBuf {
+        let in_tree = |path: &Path| path.starts_with(&self.root);
+        match self.selected.as_deref() {
+            Some(path) if path.is_dir() && in_tree(path) => path.to_path_buf(),
+            Some(path) => path
+                .parent()
+                .filter(|parent| in_tree(parent))
+                .map_or_else(|| self.root.clone(), Path::to_path_buf),
+            None => self.root.clone(),
+        }
+    }
+
+    /// Create the named file (and any folders in its name), then open it.
+    fn create_new_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(new_file) = &self.new_file else {
+            return;
+        };
+        let name = new_file.input.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            self.cancel_new_file(cx);
+            self.focus_handle.focus(window, cx);
+            return;
+        }
+        match create_file(&new_file.dir, &name) {
+            Ok(path) => {
+                self.new_file = None;
+                self.focus_handle.focus(window, cx);
+                self.selected = Some(path.clone());
+                // Re-read the folders, which now list the file, and show it.
+                self.refresh(cx);
+                self.reveal(&path);
+                cx.emit(ExplorerEvent::OpenFile(path));
+            }
+            Err(error) => {
+                if let Some(new_file) = &mut self.new_file {
+                    new_file.error = Some(error.into());
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    fn cancel_new_file(&mut self, cx: &mut Context<Self>) {
+        if self.new_file.take().is_some() {
+            self.rebuild();
+            cx.notify();
+        }
+    }
+
+    /// Escape in the name field cancels it; anywhere else it's not ours.
+    fn escape(&mut self, _: &input::Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.new_file.is_none() {
+            cx.propagate();
+            return;
+        }
+        self.cancel_new_file(cx);
+        self.focus_handle.focus(window, cx);
     }
 
     fn listing(&mut self, dir: &Path) -> &[Child] {
@@ -178,6 +296,15 @@ impl Explorer {
     }
 
     fn push_children(&mut self, dir: &Path, depth: usize, entries: &mut Vec<Entry>) {
+        if self.new_file.as_ref().is_some_and(|new_file| new_file.dir == dir) {
+            entries.push(Entry {
+                name: SharedString::default(),
+                path: dir.to_path_buf(),
+                is_dir: false,
+                depth,
+                new_file: true,
+            });
+        }
         let children = self.listing(dir).to_vec();
         for child in children {
             let expand = child.is_dir && self.expanded.contains(&child.path);
@@ -186,6 +313,7 @@ impl Explorer {
                 path: child.path.clone(),
                 is_dir: child.is_dir,
                 depth,
+                new_file: false,
             });
             if expand {
                 self.push_children(&child.path, depth + 1, entries);
@@ -194,7 +322,9 @@ impl Explorer {
     }
 
     fn index_of(&self, path: &Path) -> Option<usize> {
-        self.entries.iter().position(|entry| entry.path == path)
+        self.entries
+            .iter()
+            .position(|entry| !entry.new_file && entry.path == path)
     }
 
     fn selected_index(&self) -> Option<usize> {
@@ -304,6 +434,25 @@ impl Explorer {
         range
             .filter_map(|ix| {
                 let entry = self.entries.get(ix)?;
+                if entry.new_file {
+                    let new_file = self.new_file.as_ref()?;
+                    return Some(
+                        div()
+                            .id(("explorer-entry", ix))
+                            .h(ROW_HEIGHT)
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .pl(px(8. + INDENT * entry.depth as f32))
+                            .pr_2()
+                            .text_sm()
+                            .child(div().w(px(14.)).flex_none())
+                            .child(Icon::new(IconName::File).small().text_color(muted))
+                            .child(div().flex_1().min_w_0().child(Input::new(&new_file.input).xsmall()))
+                            .into_any_element(),
+                    );
+                }
                 let is_active = self.active_file.as_deref() == Some(entry.path.as_path());
                 let is_selected = self.selected.as_deref() == Some(entry.path.as_path());
                 let expanded = self.expanded.contains(&entry.path);
@@ -356,7 +505,7 @@ impl Render for Explorer {
             .file_name()
             .map_or_else(|| self.root.display().to_string(), |name| name.to_string_lossy().into_owned())
             .to_uppercase();
-        let muted = theme.muted_foreground;
+        let (muted, danger) = (theme.muted_foreground, theme.danger);
 
         div()
             .v_flex()
@@ -368,6 +517,7 @@ impl Render for Explorer {
             .on_action(cx.listener(Self::expand_selected))
             .on_action(cx.listener(Self::collapse_selected))
             .on_action(cx.listener(Self::open_selected))
+            .on_action(cx.listener(Self::escape))
             .child(
                 div()
                     .h_flex()
@@ -387,6 +537,14 @@ impl Render for Explorer {
                             .child(folder_name),
                     )
                     .child(
+                        Button::new("explorer-new-file")
+                            .ghost()
+                            .xsmall()
+                            .icon(LucideIcon::FilePlus)
+                            .tooltip("New File…")
+                            .on_click(cx.listener(|this, _, window, cx| this.start_new_file(window, cx))),
+                    )
+                    .child(
                         Button::new("explorer-refresh")
                             .ghost()
                             .xsmall()
@@ -402,6 +560,19 @@ impl Render for Explorer {
                             .tooltip("Collapse folders")
                             .on_click(cx.listener(|this, _, _, cx| this.collapse_all(cx))),
                     ),
+            )
+            .when_some(
+                self.new_file.as_ref().and_then(|new_file| new_file.error.clone()),
+                |column, error| {
+                    column.child(
+                        div()
+                            .px_3()
+                            .pb_1()
+                            .text_xs()
+                            .text_color(danger)
+                            .child(error),
+                    )
+                },
             )
             .child(
                 div()
@@ -460,6 +631,30 @@ fn read_folder(dir: &Path) -> Vec<Child> {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     children
+}
+
+/// Create an empty file named `name` in `dir`, along with any folders the
+/// name includes ("src/new.rs"). Returns its path, or why it couldn't.
+fn create_file(dir: &Path, name: &str) -> Result<PathBuf, String> {
+    let mut path = dir.to_path_buf();
+    for component in Path::new(name).components() {
+        match component {
+            Component::Normal(part) => path.push(part),
+            Component::CurDir => {}
+            _ => return Err(format!("\"{name}\" isn't a name inside this folder.")),
+        }
+    }
+    if path == dir || name.ends_with(['/', '\\']) {
+        return Err("Enter a file name.".into());
+    }
+    if path.exists() {
+        return Err(format!("\"{name}\" already exists."));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| format!("Couldn't create the folder: {err}"))?;
+    }
+    std::fs::File::create_new(&path).map_err(|err| format!("Couldn't create \"{name}\": {err}"))?;
+    Ok(path)
 }
 
 /// `canonicalize` on Windows returns `\\?\C:\...` paths; strip the prefix so
