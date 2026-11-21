@@ -5,9 +5,11 @@
 //! `cargo run -- some/folder` to show that folder in the explorer.
 //! A path that doesn't exist yet opens as a new, empty file at that path.
 
+mod changes;
 mod explorer;
 mod git;
 mod terminal;
+mod timeline;
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -17,7 +19,6 @@ use std::time::{Duration, Instant, SystemTime};
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::base::GlobalState;
 use gpui_kit::component::button::*;
-use gpui_kit::component::diff::{Diff, DiffFile, DiffFileStatus, DiffMode, DiffSide, DiffState};
 use gpui_kit::component::input::{
     self as edit, Editor, EditorState, GutterDecoration, GutterDecorationCollection, InputEvent,
     OverviewRulerDecoration, OverviewRulerDecorationCollection, OverviewRulerLane, Position,
@@ -28,6 +29,8 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use changes::{ChangedFile, ChangesEvent, ChangesView, Mode, Select};
+use timeline::Timeline;
 use explorer::{Explorer, ExplorerEvent};
 use terminal::{TerminalEvent, TerminalView};
 
@@ -39,6 +42,8 @@ gpui_kit::actions!(
         OpenFolder,
         ToggleSidebar,
         ToggleChanges,
+        ReviewChanges,
+        ShowTimeline,
         FocusExplorer,
         SaveFile,
         SaveFileAs,
@@ -65,7 +70,7 @@ const MARKER_DELAY: Duration = Duration::from_millis(150);
 const REPO_POLL: Duration = Duration::from_millis(1500);
 
 // Icons beyond the kit's default set, embedded on top of it.
-gpui_kit::assets::icon_assets!(ExtraIcons, [GitBranch]);
+gpui_kit::assets::icon_assets!(ExtraIcons, [Circle, GitBranch]);
 
 struct AppAssets;
 
@@ -179,6 +184,8 @@ fn app_menus(checks: MenuChecks) -> Vec<Menu> {
         Menu::new("View").items([
             MenuItem::action("Explorer", ToggleSidebar).checked(checks.sidebar),
             MenuItem::action("Changes", ToggleChanges).checked(checks.changes),
+            MenuItem::action("Review Changes Step by Step", ReviewChanges),
+            MenuItem::action("Edit Timeline", ShowTimeline),
             MenuItem::action("Terminal", ToggleTerminal).checked(checks.terminal),
             MenuItem::separator(),
             MenuItem::action("Word Wrap", ToggleSoftWrap).checked(checks.soft_wrap),
@@ -317,16 +324,15 @@ struct Workspace {
     menu_checks: Option<MenuChecks>,
     /// The Git repository of the explorer's folder, if it's in one.
     repo: Option<git::Repo>,
+    /// Every edit to the repository's files, in order, since the last commit.
+    timeline: Option<Entity<Timeline>>,
     /// Last seen modification times in `.git`, to notice commits and staging.
     repo_stamp: Option<Vec<Option<SystemTime>>>,
     branch: Option<SharedString>,
     changed_files: usize,
     /// Every changed file in the repository, shown in place of the editor.
-    changes: Entity<DiffState>,
+    changes: Entity<ChangesView>,
     changes_visible: bool,
-    changes_loaded: bool,
-    /// The file to scroll the Changes view to once it has loaded.
-    changes_scroll_to: Option<String>,
     _repo_task: Option<Task<()>>,
     _changes_task: Option<Task<()>>,
     _repo_watch: Task<()>,
@@ -353,7 +359,7 @@ impl Workspace {
             .unwrap_or_default();
 
         let explorer = cx.new(|cx| Explorer::new(root, cx));
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.subscribe_in(&explorer, window, Self::on_explorer_event),
             // Pick up files created elsewhere when the user comes back.
             cx.observe_window_activation(window, |this, window, cx| {
@@ -370,7 +376,8 @@ impl Workspace {
                 }
             }),
         ];
-        let changes = cx.new(|cx| DiffState::new(Vec::new(), cx));
+        let changes = cx.new(|cx| ChangesView::new(true, cx));
+        subscriptions.push(cx.subscribe_in(&changes, window, Self::on_changes_event));
         // Notice commits, checkouts and staging done outside the editor, or
         // in its terminal.
         let repo_watch = cx.spawn(async move |this, cx| {
@@ -400,13 +407,12 @@ impl Workspace {
             menu_bar: AppMenuBar::new(cx),
             menu_checks: None,
             repo: None,
+            timeline: None,
             repo_stamp: None,
             branch: None,
             changed_files: 0,
             changes,
             changes_visible: false,
-            changes_loaded: false,
-            changes_scroll_to: None,
             _repo_task: None,
             _changes_task: None,
             _repo_watch: repo_watch,
@@ -582,7 +588,12 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Focus what the main area shows: the active editor, or the Changes view.
     fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.changes_visible {
+            self.changes.read(cx).focus_handle(cx).focus(window, cx);
+            return;
+        }
         let editor = self.active_document().editor.clone();
         editor.update(cx, |state, cx| state.focus(window, cx));
     }
@@ -749,6 +760,11 @@ impl Workspace {
         if let Err(err) = std::fs::write(&path, text.as_bytes()) {
             self.set_status(format!("Couldn't save {}: {err}", path.display()), true, cx);
             return false;
+        }
+        // So the timeline marks this edit as saved here. The watcher hears
+        // about the write later, on the main thread, so this comes first.
+        if let Some(timeline) = &self.timeline {
+            timeline.update(cx, |timeline, _| timeline.note_saved(&path, &text));
         }
 
         // "Save As" with a new extension switches the highlighting.
@@ -923,8 +939,15 @@ impl Workspace {
             this.update(cx, |this, cx| {
                 if this.repo != repo {
                     this.repo_stamp = repo.as_ref().map(git::Repo::stamp);
+                    this.timeline = repo
+                        .clone()
+                        .map(|repo| cx.new(|cx| Timeline::new(repo, cx)));
                     this.repo = repo;
-                    this.changes_loaded = false;
+                    let timeline = this.timeline.clone();
+                    this.changes.update(cx, |view, cx| {
+                        view.set_loading(cx);
+                        view.set_timeline(timeline, cx);
+                    });
                 }
                 this.refresh_changes(cx);
             })
@@ -941,6 +964,10 @@ impl Workspace {
         if self.repo_stamp != stamp {
             self.repo_stamp = stamp;
             self.refresh_git(cx);
+            // A commit starts a new timeline.
+            if let Some(timeline) = &self.timeline {
+                timeline.update(cx, |timeline, cx| timeline.check_head(cx));
+            }
         }
     }
 
@@ -1072,8 +1099,7 @@ impl Workspace {
         let Some(repo) = self.repo.clone() else {
             self.branch = None;
             self.changed_files = 0;
-            self.changes_loaded = true;
-            self.changes.update(cx, |state, cx| state.set_files(Vec::new(), cx));
+            self.changes.update(cx, |view, cx| view.set_not_a_repository(cx));
             cx.notify();
             return;
         };
@@ -1086,8 +1112,9 @@ impl Workspace {
             .collect();
         let with_diffs = self.changes_visible;
 
+        let root = repo.root.clone();
         self._changes_task = Some(cx.spawn(async move |this, cx| {
-            let (branch, count, patch) = cx
+            let (branch, count, patches) = cx
                 .background_spawn(async move {
                     let unsaved: Vec<(String, String)> = unsaved
                         .into_iter()
@@ -1110,29 +1137,24 @@ impl Workspace {
                             .collect::<Vec<_>>()
                     });
                     let count = patch.as_ref().map_or(paths.len(), Vec::len);
-                    (repo.branch(), count, patch.map(|patches| patches.concat()))
+                    (repo.branch(), count, patch)
                 })
                 .await;
 
             this.update(cx, |this, cx| {
-                this.branch = branch.map(SharedString::from);
+                let branch = branch.map(SharedString::from);
+                this.branch = branch.clone();
                 this.changed_files = count;
-                if let Some(patch) = patch {
-                    let files = match DiffFile::parse(&patch) {
-                        Ok(files) => files,
-                        Err(err) => {
-                            this.set_status(format!("Couldn't read the changes: {}", err.message()), true, cx);
-                            Vec::new()
+                if let Some(patches) = patches {
+                    let mut files = Vec::new();
+                    for patch in &patches {
+                        match ChangedFile::parse(patch) {
+                            Ok(file) => files.push(file),
+                            Err(err) => this.set_status(format!("Couldn't read a change: {err}"), true, cx),
                         }
-                    };
-                    let scroll_to = this.changes_scroll_to.take();
-                    this.changes.update(cx, |state, cx| {
-                        state.set_files(files, cx);
-                        if let Some(path) = scroll_to {
-                            state.scroll_to_file(&path, cx);
-                        }
-                    });
-                    this.changes_loaded = true;
+                    }
+                    this.changes
+                        .update(cx, |view, cx| view.set_changes(root, branch, files, cx));
                 }
                 cx.notify();
             })
@@ -1143,24 +1165,63 @@ impl Workspace {
     /// Show or hide every change since the last commit, in place of the editor.
     fn toggle_changes(&mut self, _: &ToggleChanges, window: &mut Window, cx: &mut Context<Self>) {
         if self.changes_visible {
-            self.changes_visible = false;
-            self.focus_active(window, cx);
-            cx.notify();
+            self.hide_changes(window, cx);
             return;
         }
+        // Reviewing picks up at the first file not yet reviewed; showing
+        // everything starts at the file being edited.
+        let select = if self.changes.read(cx).mode() != Mode::AllFiles {
+            Some(Select::FirstUnreviewed)
+        } else {
+            self.repo.as_ref().and_then(|repo| {
+                let path = self.documents.get(self.active)?.path.as_deref()?;
+                repo.relative(path).map(Select::File)
+            })
+        };
+        self.show_changes(select, window, cx);
+    }
+
+    /// Step through the changes one file at a time.
+    fn review_changes(&mut self, _: &ReviewChanges, window: &mut Window, cx: &mut Context<Self>) {
+        self.changes
+            .update(cx, |view, cx| view.set_mode(Mode::ByFile, cx));
+        self.show_changes(Some(Select::FirstUnreviewed), window, cx);
+    }
+
+    /// Step through every edit in the order it happened.
+    fn show_timeline(&mut self, _: &ShowTimeline, window: &mut Window, cx: &mut Context<Self>) {
+        self.changes.update(cx, |view, cx| view.review_timeline(cx));
+        self.show_changes(None, window, cx);
+    }
+
+    fn show_changes(&mut self, select: Option<Select>, window: &mut Window, cx: &mut Context<Self>) {
         self.changes_visible = true;
-        // Start at the file being edited.
-        self.changes_scroll_to = self.repo.as_ref().and_then(|repo| {
-            let path = self.documents.get(self.active)?.path.as_deref()?;
-            repo.relative(path)
-        });
+        if let Some(select) = select {
+            self.changes.update(cx, |view, _| view.select_on_load(select));
+        }
         self.refresh_changes(cx);
         self.changes.read(cx).focus_handle(cx).focus(window, cx);
         cx.notify();
     }
 
-    fn set_diff_mode(&mut self, mode: DiffMode, cx: &mut Context<Self>) {
-        self.changes.update(cx, |state, cx| state.set_mode(mode, cx));
+    fn hide_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.changes_visible = false;
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    fn on_changes_event(
+        &mut self,
+        _: &Entity<ChangesView>,
+        event: &ChangesEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ChangesEvent::OpenFile { path, line } => self.open_at(path.clone(), *line, window, cx),
+            ChangesEvent::Refresh => self.refresh_git(cx),
+            ChangesEvent::Close => self.hide_changes(window, cx),
+        }
     }
 
     /// Open a file from the Changes view, at a 1-based line if given.
@@ -1302,6 +1363,8 @@ impl Workspace {
             doc.editor
                 .update(cx, |state, cx| state.set_soft_wrap(soft_wrap, window, cx));
         }
+        self.changes
+            .update(cx, |view, cx| view.set_soft_wrap(soft_wrap, cx));
         self.focus_active(window, cx);
         cx.notify();
     }
@@ -1387,181 +1450,6 @@ impl Workspace {
                         })),
                 )
             }))
-    }
-
-    /// Every change since the last commit, one file after another, in place
-    /// of the tabs and the editor.
-    fn render_changes(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let (muted, border, success, danger) = (
-            theme.muted_foreground,
-            theme.border,
-            theme.success,
-            theme.danger,
-        );
-        let state = self.changes.read(cx);
-        let files = state.files();
-        let mode = state.mode();
-        let (additions, deletions) = files
-            .iter()
-            .fold((0, 0), |(a, d), file| (a + file.additions(), d + file.deletions()));
-        let summary = match files.len() {
-            0 => String::new(),
-            1 => "1 changed file".into(),
-            n => format!("{n} changed files"),
-        };
-        let has_files = !files.is_empty();
-
-        let message = |text: &str| {
-            div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_sm()
-                .text_color(muted)
-                .child(text.to_string())
-                .into_any_element()
-        };
-        let body = match &self.repo {
-            None => message("The folder in the explorer isn't in a Git repository."),
-            Some(_) if !self.changes_loaded => message("Loading changes…"),
-            Some(_) if !has_files => message("No changes since the last commit."),
-            Some(repo) => {
-                let workspace = cx.weak_entity();
-                let root = repo.root.clone();
-                let open_button = {
-                    let (workspace, root) = (workspace.clone(), root.clone());
-                    move |file: &DiffFile, _: &mut Window, _: &mut App| {
-                        let path = root.join(file.path().to_string());
-                        let workspace = workspace.clone();
-                        div().when(file.status() != DiffFileStatus::Deleted, |this| {
-                            this.child(
-                                Button::new(SharedString::from(format!("open:{}", file.path())))
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::ExternalLink)
-                                    .label("Open")
-                                    .on_click(move |_, window, cx| {
-                                        workspace
-                                            .update(cx, |this, cx| this.open_path(path.clone(), window, cx))
-                                            .ok();
-                                    }),
-                            )
-                        })
-                    }
-                };
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .child(
-                        Diff::new(&self.changes)
-                            .size_full()
-                            .soft_wrap(self.soft_wrap)
-                            .header_suffix(open_button)
-                            // Double-click a line to edit the file there.
-                            .on_line_click(move |position, event, window, cx| {
-                                if event.click_count() < 2 {
-                                    return;
-                                }
-                                let path = root.join(position.path().to_string());
-                                let line = (position.side() == DiffSide::Modified).then(|| position.line());
-                                workspace
-                                    .update(cx, |this, cx| this.open_at(path, line, window, cx))
-                                    .ok();
-                            }),
-                    )
-                    .into_any_element()
-            }
-        };
-
-        let mode_button = |id: &'static str, label: &'static str, value: DiffMode| {
-            Button::new(id)
-                .ghost()
-                .xsmall()
-                .label(label)
-                .selected(mode == value)
-                .on_click(cx.listener(move |this, _, _, cx| this.set_diff_mode(value, cx)))
-        };
-
-        div()
-            .v_flex()
-            .flex_1()
-            .min_h_0()
-            .child(
-                div()
-                    .h_flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_2()
-                    .pl_3()
-                    .pr_1()
-                    .py_1()
-                    .border_b_1()
-                    .border_color(border)
-                    .text_xs()
-                    .text_color(muted)
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("CHANGES"))
-                    .when_some(self.branch.clone(), |row, branch| {
-                        row.child(
-                            div()
-                                .h_flex()
-                                .items_center()
-                                .gap_1()
-                                .child(Icon::new(LucideIcon::GitBranch).xsmall())
-                                .child(branch),
-                        )
-                    })
-                    .child(summary)
-                    .when(has_files, |row| {
-                        row.child(div().text_color(success).child(format!("+{additions}")))
-                            .child(div().text_color(danger).child(format!("−{deletions}")))
-                    })
-                    .child(div().flex_1())
-                    .child(mode_button("diff-unified", "Unified", DiffMode::Unified))
-                    .child(mode_button("diff-split", "Split", DiffMode::Split))
-                    .child(
-                        Button::new("previous-change")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::ArrowUp)
-                            .tooltip("Previous change")
-                            .disabled(!has_files)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.changes.update(cx, |state, cx| state.previous_change(cx))
-                            })),
-                    )
-                    .child(
-                        Button::new("next-change")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::ArrowDown)
-                            .tooltip("Next change")
-                            .disabled(!has_files)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.changes.update(cx, |state, cx| state.next_change(cx))
-                            })),
-                    )
-                    .child(
-                        Button::new("refresh-changes")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::RefreshCw)
-                            .tooltip("Refresh")
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh_git(cx))),
-                    )
-                    .child(
-                        Button::new("close-changes")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Close)
-                            .tooltip(format!("Close ({})", shortcut("Shift+G")))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_changes(&ToggleChanges, window, cx)
-                            })),
-                    ),
-            )
-            .child(body)
     }
 
     fn render_terminal_panel(&self, terminal: &Entity<TerminalView>, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1785,6 +1673,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_changes))
+            .on_action(cx.listener(Self::review_changes))
+            .on_action(cx.listener(Self::show_timeline))
             .on_action(cx.listener(Self::focus_explorer))
             .on_action(cx.listener(Self::save_file))
             .on_action(cx.listener(Self::save_file_as))
@@ -1847,7 +1737,8 @@ impl Render for Workspace {
                             .h_full()
                             .map(|column| {
                                 if self.changes_visible {
-                                    return column.child(self.render_changes(cx));
+                                    return column
+                                        .child(div().flex_1().min_h_0().child(self.changes.clone()));
                                 }
                                 column.child(self.render_tab_bar(cx)).child(
                                     div().flex_1().min_h_0().child(
@@ -1903,6 +1794,7 @@ fn bind_keys(cx: &mut App) {
     ]);
     terminal::bind_keys(cx);
     explorer::bind_keys(cx);
+    changes::bind_keys(cx);
 }
 
 fn main() {

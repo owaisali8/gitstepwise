@@ -4,9 +4,11 @@
 //!
 //! Everything here blocks on `git`, so callers run it on a background thread.
 
+use std::collections::HashSet;
+use std::io::Write as _;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 use similar::{Algorithm, DiffOp, capture_diff_slices_deadline};
@@ -99,10 +101,50 @@ impl Repo {
         paths
     }
 
+    /// The commit checked out, or `None` before the first commit.
+    pub fn head(&self) -> Option<String> {
+        run_text(git(&self.root).args(["rev-parse", "-q", "--verify", "HEAD"]))
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+    }
+
+    /// Which of `paths` (relative, `/`-separated) Git ignores, by the
+    /// repository's `.gitignore` files and excludes. Tracked files never are.
+    pub fn ignored(&self, paths: &[String]) -> HashSet<String> {
+        if paths.is_empty() {
+            return HashSet::new();
+        }
+        let mut command = git(&self.root);
+        command
+            .args(["check-ignore", "--stdin", "-z"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let Ok(mut child) = command.spawn() else {
+            return HashSet::new();
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let input: Vec<u8> = paths.iter().flat_map(|path| path.bytes().chain([0])).collect();
+            let _ = stdin.write_all(&input);
+        }
+        // Exits with 1 when nothing is ignored, so read the output regardless.
+        let Ok(output) = child.wait_with_output() else {
+            return HashSet::new();
+        };
+        output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter_map(|path| std::str::from_utf8(path).ok())
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// A file's contents in the last commit, by its path relative to the root,
     /// or `None` if it isn't in the last commit.
     pub fn committed_bytes(&self, relative: &str) -> Option<Vec<u8>> {
-        run(git(&self.root).arg("show").arg(format!("HEAD:{relative}")))
+        // `cat-file blob` refuses folders, where `show` would list them.
+        run(git(&self.root).args(["cat-file", "blob"]).arg(format!("HEAD:{relative}")))
     }
 
     /// `path` relative to the root, with `/` separators.
@@ -200,21 +242,29 @@ pub fn file_patch(path: &str, old: Option<Vec<u8>>, new: Option<Vec<u8>>) -> Opt
     }
     match (text(&old), text(&new)) {
         (Ok(old), Ok(new)) => patch(path, old, new),
-        _ => {
-            let side = |exists: bool, prefix: &str| {
-                if exists {
-                    format!("{prefix}/{path}")
-                } else {
-                    "/dev/null".to_string()
-                }
-            };
-            Some(format!(
-                "diff --git a/{path} b/{path}\nBinary files {} and {} differ\n",
-                side(old.is_some(), "a"),
-                side(new.is_some(), "b"),
-            ))
-        }
+        _ => Some(binary_patch(path, old.is_some(), new.is_some())),
     }
+}
+
+/// Git's notice for a changed file that isn't text.
+pub fn binary_patch(path: &str, old_exists: bool, new_exists: bool) -> String {
+    let side = |exists: bool, prefix: &str| {
+        if exists {
+            format!("{prefix}/{path}")
+        } else {
+            "/dev/null".to_string()
+        }
+    };
+    format!(
+        "diff --git a/{path} b/{path}\nBinary files {} and {} differ\n",
+        side(old_exists, "a"),
+        side(new_exists, "b"),
+    )
+}
+
+/// Whether two texts have the same lines, ignoring CRLF versus LF.
+pub fn same_lines(a: &str, b: &str) -> bool {
+    lines(a) == lines(b)
 }
 
 /// A Git-style patch for one file, or `None` if nothing changed. `None` for a
