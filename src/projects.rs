@@ -24,8 +24,8 @@ const CONFIG_FOLDER: &str = "gitstepwise";
 #[cfg(not(target_os = "linux"))]
 const CONFIG_FOLDER: &str = "Gitstepwise";
 
-/// A folder opened as a project, and what was open in it.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// A folder opened as a project, what was open in it, and its notes.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub path: PathBuf,
     /// When it was last opened, in milliseconds since the Unix epoch.
@@ -36,6 +36,19 @@ pub struct Project {
     /// The file that was showing.
     #[serde(default)]
     pub active: Option<PathBuf>,
+    /// Notes about the project, as typed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub notes: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub todos: Vec<Todo>,
+}
+
+/// One thing to do in a project.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Todo {
+    pub text: String,
+    #[serde(default)]
+    pub done: bool,
 }
 
 /// Every remembered project, the most recently opened first.
@@ -108,8 +121,7 @@ impl Projects {
             None => Project {
                 path,
                 opened: now,
-                files: Vec::new(),
-                active: None,
+                ..Project::default()
             },
         };
         self.projects.insert(0, project);
@@ -127,6 +139,26 @@ impl Projects {
         }
         project.files = files.to_vec();
         project.active = active.map(Path::to_path_buf);
+        true
+    }
+
+    /// Keep the notes and to-dos of the project at `path`, adding it to the
+    /// list if it isn't on it yet. Returns whether that changed anything.
+    pub fn set_notes(&mut self, path: &Path, notes: &str, todos: &[Todo], now: u64) -> bool {
+        if self.get(path).is_none() {
+            if notes.is_empty() && todos.is_empty() {
+                return false;
+            }
+            self.opened(path.to_path_buf(), now);
+        }
+        let Some(project) = self.projects.iter_mut().find(|project| same_folder(&project.path, path)) else {
+            return false;
+        };
+        if project.notes == notes && project.todos == todos {
+            return false;
+        }
+        project.notes = notes.to_string();
+        project.todos = todos.to_vec();
         true
     }
 
@@ -467,16 +499,51 @@ impl Render for ProjectPicker {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: the glob of `gpui_kit` would replace `#[test]`.
-    use super::{Project, Projects, display_path, fuzzy_score, ranked, same_folder, MAX_PROJECTS};
+    use super::{Project, Projects, Todo, display_path, fuzzy_score, ranked, same_folder, MAX_PROJECTS};
     use std::path::{Path, PathBuf};
 
     fn project(path: &str) -> Project {
         Project {
             path: PathBuf::from(path),
-            opened: 0,
-            files: Vec::new(),
-            active: None,
+            ..Project::default()
         }
+    }
+
+    #[test]
+    fn a_project_keeps_its_notes_and_to_dos() {
+        let mut projects = Projects::default();
+        projects.opened("/code/a".into(), 1);
+        let todos = [Todo {
+            text: "Check the tests".into(),
+            done: false,
+        }];
+        assert!(projects.set_notes(Path::new("/code/a"), "Ask about the API.", &todos, 2));
+        assert!(!projects.set_notes(Path::new("/code/a"), "Ask about the API.", &todos, 3));
+        // Opening it again, or another project, keeps them.
+        projects.opened("/code/b".into(), 4);
+        projects.opened("/code/a".into(), 5);
+        let a = projects.get(Path::new("/code/a")).unwrap();
+        assert_eq!(a.notes, "Ask about the API.");
+        assert_eq!(a.todos, todos);
+    }
+
+    #[test]
+    fn notes_for_a_folder_off_the_list_add_it() {
+        let mut projects = Projects::default();
+        // Nothing to keep: the folder isn't added.
+        assert!(!projects.set_notes(Path::new("/code/new"), "", &[], 1));
+        assert!(projects.list().is_empty());
+        assert!(projects.set_notes(Path::new("/code/new"), "Started.", &[], 2));
+        assert_eq!(projects.list()[0].path, Path::new("/code/new"));
+        assert_eq!(projects.list()[0].notes, "Started.");
+    }
+
+    #[test]
+    fn a_list_saved_before_notes_still_loads() {
+        let json = br#"{"version": 1, "projects": [{"path": "/code/a", "opened": 1}]}"#;
+        let projects = Projects::from_json(json);
+        assert_eq!(projects.list()[0].notes, "");
+        assert!(projects.list()[0].todos.is_empty());
     }
 
     #[test]

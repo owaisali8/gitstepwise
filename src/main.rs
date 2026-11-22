@@ -15,6 +15,7 @@ mod explorer;
 mod file_icons;
 mod git;
 mod markdown;
+mod notes;
 mod projects;
 mod terminal;
 mod terminal_panel;
@@ -45,6 +46,7 @@ use changes::{ChangedFile, ChangesEvent, ChangesView, Mode, Select};
 use timeline::Timeline;
 use explorer::{Explorer, ExplorerEvent};
 use markdown::{EmbeddedImages, Links, Target};
+use notes::{NotesEvent, NotesPanel};
 use projects::{ProjectPicker, ProjectPickerEvent, Projects};
 use terminal_panel::{SplitDown, SplitRight, TerminalPanel, TerminalPanelEvent};
 
@@ -57,6 +59,8 @@ gpui_kit::actions!(
         /// Switch to another project: the picker of recent folders.
         OpenRecent,
         ToggleSidebar,
+        /// Show or hide the project's notes and to-do list.
+        ToggleNotes,
         ToggleChanges,
         ReviewChanges,
         ShowTimeline,
@@ -92,6 +96,7 @@ const KEY_CONTEXT: &str = "TextEditor";
 const PLAIN_TEXT: &str = "text";
 const MIN_TERMINAL_HEIGHT: Pixels = px(80.);
 const MIN_SIDEBAR_WIDTH: Pixels = px(140.);
+const MIN_NOTES_WIDTH: Pixels = px(200.);
 /// How long typing pauses before the gutter's change markers update.
 const MARKER_DELAY: Duration = Duration::from_millis(150);
 /// How often to check the repository for commits, checkouts and staging.
@@ -122,6 +127,7 @@ gpui_kit::assets::icon_assets!(
         FileText,
         FolderPlus,
         GitBranch,
+        ListTodo,
         Package,
         Rows2,
         Scale,
@@ -204,6 +210,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 #[derive(Clone, Copy, PartialEq)]
 struct MenuChecks {
     sidebar: bool,
+    notes: bool,
     changes: bool,
     terminal: bool,
     soft_wrap: bool,
@@ -247,6 +254,7 @@ fn app_menus(checks: MenuChecks) -> Vec<Menu> {
         ]),
         Menu::new("View").items([
             MenuItem::action("Explorer", ToggleSidebar).checked(checks.sidebar),
+            MenuItem::action("Notes and To-do", ToggleNotes).checked(checks.notes),
             MenuItem::action("Changes", ToggleChanges).checked(checks.changes),
             MenuItem::action("Review Changes Step by Step", ReviewChanges),
             MenuItem::action("Edit Timeline", ShowTimeline),
@@ -421,6 +429,7 @@ impl FpsMeter {
 enum Resize {
     Terminal { start_y: Pixels, start_height: Pixels },
     Sidebar { start_x: Pixels, start_width: Pixels },
+    Notes { start_x: Pixels, start_width: Pixels },
 }
 
 struct Workspace {
@@ -438,6 +447,10 @@ struct Workspace {
     explorer: Entity<Explorer>,
     sidebar_visible: bool,
     sidebar_width: Pixels,
+    /// The project's notes and to-dos, in a panel at the right.
+    notes: Entity<NotesPanel>,
+    notes_visible: bool,
+    notes_width: Pixels,
     /// The terminals, once one has been opened.
     terminal: Option<Entity<TerminalPanel>>,
     terminal_visible: bool,
@@ -510,9 +523,17 @@ impl Workspace {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
 
-        let explorer = cx.new(|cx| Explorer::new(root, cx));
+        let explorer = cx.new(|cx| Explorer::new(root.clone(), cx));
+        let notes = cx.new(|cx| {
+            let mut notes = NotesPanel::new(window, cx);
+            notes.set_project(root, window, cx);
+            notes
+        });
         let mut subscriptions = vec![
             cx.subscribe_in(&explorer, window, Self::on_explorer_event),
+            cx.subscribe_in(&notes, window, Self::on_notes_event),
+            // The status bar counts the to-dos left.
+            cx.observe(&notes, |_, _, cx| cx.notify()),
             // Pick up files created elsewhere when the user comes back.
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
@@ -553,6 +574,9 @@ impl Workspace {
             explorer,
             sidebar_visible: true,
             sidebar_width: px(240.),
+            notes,
+            notes_visible: false,
+            notes_width: px(300.),
             terminal: None,
             terminal_visible: false,
             terminal_height: px(260.),
@@ -736,9 +760,11 @@ impl Workspace {
             .update(cx, |explorer, cx| explorer.set_active_file(path.as_deref(), cx));
     }
 
-    fn show_folder(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+    fn show_folder(&mut self, folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.explorer
-            .update(cx, |explorer, cx| explorer.set_root(folder, cx));
+            .update(cx, |explorer, cx| explorer.set_root(folder.clone(), cx));
+        self.notes
+            .update(cx, |notes, cx| notes.set_project(folder, window, cx));
         self.sidebar_visible = true;
         self.refresh_repo(cx);
         cx.notify();
@@ -827,6 +853,8 @@ impl Workspace {
         self.changes_active = false;
         self.explorer
             .update(cx, |explorer, cx| explorer.set_root(folder.clone(), cx));
+        self.notes
+            .update(cx, |notes, cx| notes.set_project(folder.clone(), window, cx));
         self.sidebar_visible = true;
         self.remember_opened(folder.clone(), cx);
         self.restore_session(&folder, window, cx);
@@ -919,6 +947,38 @@ impl Workspace {
             self.focus_active(window, cx);
         }
         cx.notify();
+    }
+
+    /// Show the notes and to-dos, with the cursor in the to-do field, or
+    /// hide them.
+    fn toggle_notes(&mut self, _: &ToggleNotes, window: &mut Window, cx: &mut Context<Self>) {
+        if self.notes_visible {
+            self.hide_notes(window, cx);
+            return;
+        }
+        self.notes_visible = true;
+        self.notes.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn hide_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.notes_visible = false;
+        if self.notes.read(cx).has_focus(window, cx) {
+            self.focus_active(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn on_notes_event(
+        &mut self,
+        _: &Entity<NotesPanel>,
+        event: &NotesEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            NotesEvent::Close => self.hide_notes(window, cx),
+        }
     }
 
     fn focus_explorer(&mut self, _: &FocusExplorer, window: &mut Window, cx: &mut Context<Self>) {
@@ -1073,7 +1133,7 @@ impl Workspace {
     /// is shown in the explorer instead.
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if path.is_dir() {
-            self.show_folder(path, cx);
+            self.show_folder(path, window, cx);
             return;
         }
 
@@ -1205,6 +1265,7 @@ impl Workspace {
         let doc = self.active_document().filter(|_| !self.changes_active);
         let checks = MenuChecks {
             sidebar: self.sidebar_visible,
+            notes: self.notes_visible,
             changes: self.changes_open,
             terminal: self.terminal_visible,
             soft_wrap: self.soft_wrap,
@@ -2413,6 +2474,24 @@ impl Workspace {
                 this.toggle_terminal(&ToggleTerminal, window, cx)
             }));
 
+        // Shows or hides the notes, with the number of to-dos left.
+        let open_todos = self.notes.read(cx).open_count();
+        let notes_button = div()
+            .id("notes-status")
+            .h_flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .cursor_pointer()
+            .when(self.notes_visible, |button| button.text_color(theme.foreground))
+            .hover(|style| style.text_color(theme.foreground))
+            .child(Icon::new(LucideIcon::ListTodo).xsmall())
+            .when(open_todos > 0, |button| button.child(open_todos.to_string()))
+            .tooltip(|window, cx| {
+                Tooltip::new(format!("Show or hide notes and to-dos ({})", shortcut("Alt+B"))).build(window, cx)
+            })
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_notes(&ToggleNotes, window, cx)));
+
         let (message, message_color) = match &self.status {
             Some(status) if status.is_error => (status.message.clone(), theme.danger),
             Some(status) => (status.message.clone(), theme.muted_foreground),
@@ -2478,6 +2557,7 @@ impl Workspace {
                     .gap_4()
                     .when_some(self.fps.as_ref(), |row, meter| row.child(meter.label()))
                     .children(file_info.into_iter().flatten())
+                    .child(notes_button)
                     .child(terminal_button),
             )
     }
@@ -2505,6 +2585,7 @@ impl Render for Workspace {
         let viewport = window.viewport_size();
         let max_terminal_height = (viewport.height - px(160.)).max(MIN_TERMINAL_HEIGHT);
         let max_sidebar_width = (viewport.width - px(300.)).max(MIN_SIDEBAR_WIDTH);
+        let max_notes_width = (viewport.width - px(300.)).max(MIN_NOTES_WIDTH);
         let terminal = self
             .terminal
             .clone()
@@ -2546,6 +2627,42 @@ impl Render for Workspace {
                 )
         });
 
+        let notes = self.notes_visible.then(|| {
+            div()
+                .h_flex()
+                .flex_none()
+                .h_full()
+                .child(
+                    // Drag to resize the notes.
+                    div()
+                        .id("notes-divider")
+                        .w(px(5.))
+                        .h_full()
+                        .flex_none()
+                        .border_r_1()
+                        .border_color(border)
+                        .cursor(CursorStyle::ResizeColumn)
+                        .hover(|style| style.bg(accent))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                this.resizing = Some(Resize::Notes {
+                                    start_x: event.position.x,
+                                    start_width: this.notes_width,
+                                });
+                                cx.stop_propagation();
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .w(self.notes_width)
+                        .h_full()
+                        .bg(sidebar_bg)
+                        .child(self.notes.clone()),
+                )
+        });
+
         div()
             .v_flex()
             .size_full()
@@ -2555,6 +2672,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::open_recent))
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::toggle_notes))
             .on_action(cx.listener(Self::toggle_changes))
             .on_action(cx.listener(Self::review_changes))
             .on_action(cx.listener(Self::show_timeline))
@@ -2604,6 +2722,14 @@ impl Render for Workspace {
                         this.sidebar_width = (start_width + (event.position.x - start_x))
                             .clamp(MIN_SIDEBAR_WIDTH, max_sidebar_width);
                     }
+                    Resize::Notes {
+                        start_x,
+                        start_width,
+                    } => {
+                        // The panel's left edge: dragging left widens it.
+                        this.notes_width = (start_width - (event.position.x - start_x))
+                            .clamp(MIN_NOTES_WIDTH, max_notes_width);
+                    }
                 }
                 cx.notify();
             }))
@@ -2641,7 +2767,8 @@ impl Render for Workspace {
                             .when_some(terminal, |this, terminal| {
                                 this.child(self.render_terminal_panel(&terminal, cx))
                             }),
-                    ),
+                    )
+                    .children(notes),
             )
             .child(self.render_status_bar(cx))
             // The list of projects, over everything near the top, as in Zed.
@@ -2683,6 +2810,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(concat!(primary!("k"), " ", primary!("o")), OpenFolder, context),
         KeyBinding::new(primary!("alt-o"), OpenRecent, context),
         KeyBinding::new(primary!("b"), ToggleSidebar, context),
+        KeyBinding::new(primary!("alt-b"), ToggleNotes, context),
         KeyBinding::new(primary!("shift-g"), ToggleChanges, context),
         KeyBinding::new(primary!("shift-e"), FocusExplorer, context),
         KeyBinding::new(primary!("s"), SaveFile, context),

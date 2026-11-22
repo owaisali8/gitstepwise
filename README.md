@@ -55,6 +55,11 @@ was made. Step through until you've seen everything, then commit.
   back to it, or when Gitstepwise starts without a folder or file to open.
 - A project's terminals keep running while another project shows, and its edit
   timeline keeps recording.
+- Each project has its own **notes and to-do list**, in a panel at the right
+  (View → Notes and To-do, the to-do icon in the status bar, or Ctrl+Alt+B).
+  Type a to-do and press Enter; tick it off when it's done. The status bar
+  counts the to-dos left. They're kept with the list of projects, not in the
+  project, so they never show up as changes.
 - The list is kept in `projects.json` in your config folder
   (`%APPDATA%\Gitstepwise` on Windows).
 
@@ -139,6 +144,7 @@ On macOS, use Cmd in place of Ctrl.
 | New file / Open file | Ctrl+N / Ctrl+O |
 | Open folder | Ctrl+K, then Ctrl+O |
 | Switch project | Ctrl+Alt+O |
+| Show or hide notes and to-dos | Ctrl+Alt+B |
 | Save / Save as | Ctrl+S / Ctrl+Shift+S |
 | Close tab | Ctrl+W |
 | Next / previous tab | Ctrl+Tab / Ctrl+Shift+Tab (or Ctrl+PageDown / Ctrl+PageUp) |
@@ -207,6 +213,7 @@ starts again from the new commit.
 | `src/explorer.rs` | The file explorer |
 | `src/file_icons.rs` | The explorer's icon and color for each kind of file |
 | `src/markdown.rs` | Where the Markdown preview's links and images lead |
+| `src/notes.rs` | Each project's notes and to-do list, in a panel at the right |
 | `src/projects.rs` | The list of projects and the picker to switch between them |
 | `src/terminal.rs` | The integrated terminal |
 | `src/terminal_panel.rs` | The terminal panel: split terminals and their header |

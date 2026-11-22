@@ -30,7 +30,7 @@ CI (`.github/workflows/ci.yml`, windows-latest) runs `cargo build --locked --all
 It's one binary crate. `src/main.rs` holds `Workspace`, the root view, which owns everything else:
 
 - **Documents**: one tab per open file, each with its own `EditorState`.
-- **Child views**: `Explorer`, `ChangesView`, the optional `TerminalPanel` (which holds a `TerminalView` for each split terminal), and the `ProjectPicker` while it shows.
+- **Child views**: `Explorer`, `ChangesView`, `NotesPanel`, the optional `TerminalPanel` (which holds a `TerminalView` for each split terminal), and the `ProjectPicker` while it shows.
 - **Repository state**: the `git::Repo` and the `Timeline`.
 
 **How the views talk:**
@@ -81,6 +81,12 @@ It's one binary crate. `src/main.rs` holds `Workspace`, the root view, which own
 - `Workspace::sync_project_session` runs on every render, like `sync_menus`. It records the open files in the list and saves only when they change.
 - `open_project` asks about unsaved changes with `confirm_close_all`, then `switch_project` swaps the tabs for the ones remembered. The old project's `TerminalPanel` is parked in `parked_terminals` and comes back with it. Events from a parked panel are ignored, except `Closed`.
 - `ProjectPicker` wraps the kit's searchable `ListState`. It leaves out the project showing, so Enter goes back to the previous one.
+
+**Notes (`notes.rs`):**
+- `NotesPanel` shows the notes and to-dos of the explorer's folder. `Workspace` calls `set_project` wherever the explorer's folder changes (`Workspace::new`, `show_folder`, `switch_project`).
+- They're stored on the `Project` in `Projects` (`notes`, `todos`), so they live in the config folder, never in the repository. `set_notes` adds a folder to the list the first time it gets notes.
+- Each change updates the global at once and writes `projects.json` after `SAVE_DELAY`. `on_app_quit` writes anything still pending.
+- `set_value` on a kit input sends no `Change` event, so loading a project's notes doesn't store them back.
 
 **Markdown preview:**
 - Each `Document` has a `Preview` mode and a `TextViewState`, updated from `InputEvent::Change`.
