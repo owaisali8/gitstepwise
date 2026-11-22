@@ -11,6 +11,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod changes;
+mod credentials;
 mod explorer;
 mod file_icons;
 mod git;
@@ -20,6 +21,7 @@ mod projects;
 mod terminal;
 mod terminal_panel;
 mod timeline;
+mod vault;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -43,6 +45,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use changes::{ChangedFile, ChangesEvent, ChangesView, Mode, Select};
+use credentials::{CredentialsEvent, CredentialsPanel};
 use timeline::Timeline;
 use explorer::{Explorer, ExplorerEvent};
 use markdown::{EmbeddedImages, Links, Target};
@@ -61,6 +64,9 @@ gpui_kit::actions!(
         ToggleSidebar,
         /// Show or hide the project's notes and to-do list.
         ToggleNotes,
+        /// Show or hide the credentials: passwords, API keys and logins,
+        /// the same in every project.
+        ToggleCredentials,
         ToggleChanges,
         ReviewChanges,
         ShowTimeline,
@@ -127,10 +133,14 @@ gpui_kit::assets::icon_assets!(
         FileText,
         FolderPlus,
         GitBranch,
+        KeyRound,
         ListTodo,
+        Lock,
         Package,
+        Pencil,
         Rows2,
         Scale,
+        Trash,
     ]
 );
 
@@ -211,6 +221,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 struct MenuChecks {
     sidebar: bool,
     notes: bool,
+    credentials: bool,
     changes: bool,
     terminal: bool,
     soft_wrap: bool,
@@ -255,6 +266,7 @@ fn app_menus(checks: MenuChecks) -> Vec<Menu> {
         Menu::new("View").items([
             MenuItem::action("Explorer", ToggleSidebar).checked(checks.sidebar),
             MenuItem::action("Notes and To-do", ToggleNotes).checked(checks.notes),
+            MenuItem::action("Credentials", ToggleCredentials).checked(checks.credentials),
             MenuItem::action("Changes", ToggleChanges).checked(checks.changes),
             MenuItem::action("Review Changes Step by Step", ReviewChanges),
             MenuItem::action("Edit Timeline", ShowTimeline),
@@ -451,6 +463,10 @@ struct Workspace {
     notes: Entity<NotesPanel>,
     notes_visible: bool,
     notes_width: Pixels,
+    /// The credentials vault, over the window while it shows. It belongs to
+    /// no project, and stays unlocked across project switches.
+    credentials: Entity<CredentialsPanel>,
+    credentials_visible: bool,
     /// The terminals, once one has been opened.
     terminal: Option<Entity<TerminalPanel>>,
     terminal_visible: bool,
@@ -529,9 +545,11 @@ impl Workspace {
             notes.set_project(root, window, cx);
             notes
         });
+        let credentials = cx.new(|cx| CredentialsPanel::new(window, cx));
         let mut subscriptions = vec![
             cx.subscribe_in(&explorer, window, Self::on_explorer_event),
             cx.subscribe_in(&notes, window, Self::on_notes_event),
+            cx.subscribe_in(&credentials, window, Self::on_credentials_event),
             // The status bar counts the to-dos left.
             cx.observe(&notes, |_, _, cx| cx.notify()),
             // Pick up files created elsewhere when the user comes back.
@@ -577,6 +595,8 @@ impl Workspace {
             notes,
             notes_visible: false,
             notes_width: px(300.),
+            credentials,
+            credentials_visible: false,
             terminal: None,
             terminal_visible: false,
             terminal_height: px(260.),
@@ -911,6 +931,7 @@ impl Workspace {
             self.close_picker(window, cx);
             return;
         }
+        self.hide_credentials(window, cx);
         let current = self.default_folder(cx);
         let picker = cx.new(|cx| ProjectPicker::new(&current, window, cx));
         let subscription = cx.subscribe_in(&picker, window, Self::on_picker_event);
@@ -978,6 +999,43 @@ impl Workspace {
     ) {
         match event {
             NotesEvent::Close => self.hide_notes(window, cx),
+        }
+    }
+
+    /// Show the credentials, with the cursor in the search box (or the
+    /// master password field while they're locked), or hide them.
+    fn toggle_credentials(&mut self, _: &ToggleCredentials, window: &mut Window, cx: &mut Context<Self>) {
+        if self.credentials_visible {
+            self.hide_credentials(window, cx);
+            return;
+        }
+        self.close_picker(window, cx);
+        self.credentials_visible = true;
+        self.credentials.update(cx, |credentials, cx| credentials.shown(window, cx));
+        cx.notify();
+    }
+
+    fn hide_credentials(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.credentials_visible {
+            return;
+        }
+        self.credentials_visible = false;
+        if self.credentials.read(cx).contains_focus(window, cx) {
+            self.focus_active(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn on_credentials_event(
+        &mut self,
+        _: &Entity<CredentialsPanel>,
+        event: &CredentialsEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            CredentialsEvent::Close => self.hide_credentials(window, cx),
+            CredentialsEvent::Notice(message) => self.set_status(message.clone(), false, cx),
         }
     }
 
@@ -1266,6 +1324,7 @@ impl Workspace {
         let checks = MenuChecks {
             sidebar: self.sidebar_visible,
             notes: self.notes_visible,
+            credentials: self.credentials_visible,
             changes: self.changes_open,
             terminal: self.terminal_visible,
             soft_wrap: self.soft_wrap,
@@ -2474,6 +2533,21 @@ impl Workspace {
                 this.toggle_terminal(&ToggleTerminal, window, cx)
             }));
 
+        // Shows or hides the credentials.
+        let credentials_button = div()
+            .id("credentials-status")
+            .flex_none()
+            .cursor_pointer()
+            .when(self.credentials_visible, |button| button.text_color(theme.foreground))
+            .hover(|style| style.text_color(theme.foreground))
+            .child(Icon::new(LucideIcon::KeyRound).xsmall())
+            .tooltip(|window, cx| {
+                Tooltip::new(format!("Show or hide credentials ({})", shortcut("Alt+K"))).build(window, cx)
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.toggle_credentials(&ToggleCredentials, window, cx)
+            }));
+
         // Shows or hides the notes, with the number of to-dos left.
         let open_todos = self.notes.read(cx).open_count();
         let notes_button = div()
@@ -2557,6 +2631,7 @@ impl Workspace {
                     .gap_4()
                     .when_some(self.fps.as_ref(), |row, meter| row.child(meter.label()))
                     .children(file_info.into_iter().flatten())
+                    .child(credentials_button)
                     .child(notes_button)
                     .child(terminal_button),
             )
@@ -2673,6 +2748,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_recent))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_notes))
+            .on_action(cx.listener(Self::toggle_credentials))
             .on_action(cx.listener(Self::toggle_changes))
             .on_action(cx.listener(Self::review_changes))
             .on_action(cx.listener(Self::show_timeline))
@@ -2784,6 +2860,34 @@ impl Render for Workspace {
                         .child(picker.clone()),
                 )
             })
+            // The credentials, over a dimmed window. A click outside closes
+            // them, and doesn't reach what's underneath.
+            .when(self.credentials_visible, |root| {
+                let width = px(800.).min(viewport.width - px(32.));
+                let height = px(520.).min(viewport.height - px(96.)).max(px(240.));
+                root.child(
+                    div()
+                        .id("credentials-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .bg(hsla(0., 0., 0., 0.3))
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| this.hide_credentials(window, cx)),
+                        ),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(48.))
+                        .left_0()
+                        .right_0()
+                        .h_flex()
+                        .justify_center()
+                        .child(div().w(width).h(height).child(self.credentials.clone())),
+                )
+            })
     }
 }
 
@@ -2811,6 +2915,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(primary!("alt-o"), OpenRecent, context),
         KeyBinding::new(primary!("b"), ToggleSidebar, context),
         KeyBinding::new(primary!("alt-b"), ToggleNotes, context),
+        KeyBinding::new(primary!("alt-k"), ToggleCredentials, context),
         KeyBinding::new(primary!("shift-g"), ToggleChanges, context),
         KeyBinding::new(primary!("shift-e"), FocusExplorer, context),
         KeyBinding::new(primary!("s"), SaveFile, context),
@@ -2835,6 +2940,7 @@ fn bind_keys(cx: &mut App) {
     ]);
     terminal::bind_keys(cx);
     terminal_panel::bind_keys(cx);
+    credentials::bind_keys(cx);
     explorer::bind_keys(cx);
     changes::bind_keys(cx);
 }

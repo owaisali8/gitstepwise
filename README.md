@@ -63,6 +63,22 @@ was made. Step through until you've seen everything, then commit.
 - The list is kept in `projects.json` in your config folder
   (`%APPDATA%\Gitstepwise` on Windows).
 
+**Credentials**
+
+- A vault for API keys, passwords, server logins and any other secret, in
+  place of a text file (View → Credentials, the key icon in the status bar, or
+  Ctrl+Alt+K). It belongs to no project: every project sees the same one.
+- The first time, choose a master password. The vault is encrypted with it, and
+  locks again after 15 minutes without use, or with **Lock**.
+- Type to find a credential by its name, username, host or notes. Enter copies
+  its password and closes the vault; Ctrl+Enter copies the username. A copied
+  password is cleared from the clipboard after 30 seconds.
+- Each credential has a name, a username, a password or key, a host or URL, and
+  notes. Only the name is needed.
+- The vault is `credentials.vault`, next to `projects.json`. Back it up like any
+  file: without the master password it can't be read. If you forget the master
+  password, there's no way to get the credentials back.
+
 **The explorer**
 
 - Icons for each kind of file, in their own colors.
@@ -145,6 +161,7 @@ On macOS, use Cmd in place of Ctrl.
 | Open folder | Ctrl+K, then Ctrl+O |
 | Switch project | Ctrl+Alt+O |
 | Show or hide notes and to-dos | Ctrl+Alt+B |
+| Show or hide credentials | Ctrl+Alt+K |
 | Save / Save as | Ctrl+S / Ctrl+Shift+S |
 | Close tab | Ctrl+W |
 | Next / previous tab | Ctrl+Tab / Ctrl+Shift+Tab (or Ctrl+PageDown / Ctrl+PageUp) |
@@ -181,6 +198,10 @@ opens. These act on the selected file or folder:
 
 In the **History** view, N and P go to older and newer commits.
 
+In **Credentials**, the arrow keys move through the list, Enter copies the
+password (and closes), Ctrl+Enter copies the username, and Escape closes (or
+leaves a form without saving).
+
 In the **terminal** (as in Windows Terminal):
 
 | Action | Shortcut |
@@ -208,7 +229,9 @@ starts again from the new commit.
 | --- | --- |
 | `src/main.rs` | The window: title bar and menus, tabs, editor, status bar and shortcuts |
 | `src/changes.rs` | The Changes tab: timeline, by-file and all-files review, and commit history |
+| `src/credentials.rs` | The credentials panel: searching, copying and editing credentials |
 | `src/timeline.rs` | The file watcher and the edit timeline |
+| `src/vault.rs` | The encrypted credentials vault and its search |
 | `src/git.rs` | Reading the repository through the `git` command, and line diffs |
 | `src/explorer.rs` | The file explorer |
 | `src/file_icons.rs` | The explorer's icon and color for each kind of file |

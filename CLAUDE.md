@@ -30,17 +30,17 @@ CI (`.github/workflows/ci.yml`, windows-latest) runs `cargo build --locked --all
 It's one binary crate. `src/main.rs` holds `Workspace`, the root view, which owns everything else:
 
 - **Documents**: one tab per open file, each with its own `EditorState`.
-- **Child views**: `Explorer`, `ChangesView`, `NotesPanel`, the optional `TerminalPanel` (which holds a `TerminalView` for each split terminal), and the `ProjectPicker` while it shows.
+- **Child views**: `Explorer`, `ChangesView`, `NotesPanel`, `CredentialsPanel`, the optional `TerminalPanel` (which holds a `TerminalView` for each split terminal), and the `ProjectPicker` while it shows.
 - **Repository state**: the `git::Repo` and the `Timeline`.
 
 **How the views talk:**
-- **Upward, by events:** child views emit events (`ExplorerEvent`, `ChangesEvent`, `TerminalPanelEvent`) that `Workspace` subscribes to in `Workspace::new`. The terminal panel is created on first use, so its subscription is made in `start_terminal`. Each `TerminalView` emits `TerminalEvent` to its panel.
+- **Upward, by events:** child views emit events (`ExplorerEvent`, `ChangesEvent`, `NotesEvent`, `CredentialsEvent`, `TerminalPanelEvent`) that `Workspace` subscribes to in `Workspace::new`. The terminal panel is created on first use, so its subscription is made in `start_terminal`. Each `TerminalView` emits `TerminalEvent` to its panel.
 - **Downward, by direct calls:** `Workspace` calls into child views with `entity.update(cx, ...)`.
 - **Rule:** new cross-view behavior goes through an event plus a `Workspace` handler. Child views don't hold references to each other.
 
 **Actions, keys and menus:**
 - **Actions:** each module declares its own with `gpui_kit::actions!` and binds keys in its `bind_keys`. `main.rs`'s `bind_keys` calls all of them.
-- **Key contexts:** each view has its own key context: `"TextEditor"` for the workspace, and `"Explorer"`, `"Changes"` and `"Terminal"` inside it. The workspace's bindings apply in every child view too.
+- **Key contexts:** each view has its own key context: `"TextEditor"` for the workspace, and `"Explorer"`, `"Changes"`, `"Terminal"` and `"Credentials"` inside it. The workspace's bindings apply in every child view too.
 - **Taking a key from an outer view:** a binding in a more specific context wins. Key bindings run before `on_key_down` handlers, and a handled action stops there. So a child view that wants a key an outer context binds must bind it in its own context; handling it in `on_key_down` isn't enough. That's why the terminal binds Tab (the window uses it to move focus) and Ctrl+Shift+V (`PasteClipboard`; the workspace binds it to the Markdown preview). The terminal panel's keys are bound in `"Terminal"` too, and their actions bubble up to the panel or the workspace.
 - **Keystrokes:** `KeyBinding::new` needs `&'static str` and doesn't resolve `secondary-`. Build keystrokes with the `primary!` macro (`concat!`, Cmd on macOS and Ctrl elsewhere), not `format!`. It's defined separately in `main.rs` and `explorer.rs`, so a new module that needs it gets its own copy. `KeyBinding::new` panics on a keystroke it can't parse, which stops the app at startup; `terminal_panel.rs` builds its list in a function so a test can check it.
 - **Menus:** the View menu's check marks come from `MenuChecks`. `sync_menus` runs on every render and reinstalls the menus only when a check changes. A new checked or disabled menu state needs a field there.
@@ -87,6 +87,14 @@ It's one binary crate. `src/main.rs` holds `Workspace`, the root view, which own
 - They're stored on the `Project` in `Projects` (`notes`, `todos`), so they live in the config folder, never in the repository. `set_notes` adds a folder to the list the first time it gets notes.
 - Each change updates the global at once and writes `projects.json` after `SAVE_DELAY`. `on_app_quit` writes anything still pending.
 - `set_value` on a kit input sends no `Change` event, so loading a project's notes doesn't store them back.
+
+**Credentials (`vault.rs`, `credentials.rs`):**
+- `vault.rs` is the store, with no UI: one file, `credentials.vault` in the config folder, shared by every project. It's JSON holding the Argon2id cost and salt, and the credentials encrypted with XChaCha20-Poly1305 under the key made from the master password. A wrong password and an altered file both fail decryption (`VaultError::WrongPassword`). The cost is read from the file, and `Cost::is_sane` refuses one that would ask for absurd memory.
+- Making the key takes a fraction of a second in a release build, so `Vault::create`, `Vault::unlock` and `NewKey::make` run in `cx.background_spawn`. `Cargo.toml` builds `argon2` and `blake2` optimized in debug builds too; tests use a tiny `TEST_COST`.
+- Secrets are wiped where it's cheap: the key is `Zeroizing`, and `Credential` wipes its strings on drop (so it can't be built with `..` from another value). `Credential`'s `Debug` leaves the secret out. Text in the kit's input fields can't be wiped; `clear_form` empties them.
+- `CredentialsPanel` is created once in `Workspace::new`, so the vault stays unlocked across project switches. It shows over a dimmed backdrop that closes it on click. Screens: `Create`, `Locked`, `Open(Vault)`; when open, `Pane` says what the right side shows.
+- The list's rows hold copies without secrets (`Credential::without_secret`), searched by `vault::search`. Enter in the list is caught with `capture_action::<Confirm>` to copy the password: a click on a row confirms it too, but without dispatching `Confirm`, so a click only selects.
+- `touch` restarts the 15-minute auto-lock (`LOCK_AFTER`). A copied password is cleared from the clipboard after `CLEAR_AFTER` (and on quit) if it's still there.
 
 **Markdown preview:**
 - Each `Document` has a `Preview` mode and a `TextViewState`, updated from `InputEvent::Change`.

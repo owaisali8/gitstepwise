@@ -20,9 +20,9 @@ const MAX_PROJECTS: usize = 50;
 const FILE_VERSION: u32 = 1;
 const FILE_NAME: &str = "projects.json";
 #[cfg(target_os = "linux")]
-const CONFIG_FOLDER: &str = "gitstepwise";
+pub const CONFIG_FOLDER: &str = "gitstepwise";
 #[cfg(not(target_os = "linux"))]
-const CONFIG_FOLDER: &str = "Gitstepwise";
+pub const CONFIG_FOLDER: &str = "Gitstepwise";
 
 /// A folder opened as a project, what was open in it, and its notes.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -202,7 +202,7 @@ pub fn folder_name(path: &Path) -> String {
 }
 
 /// `path` with the home folder written as `~`, as it's shown in the list.
-fn display_path(path: &Path, home: Option<&Path>) -> String {
+pub fn display_path(path: &Path, home: Option<&Path>) -> String {
     match home.and_then(|home| path.strip_prefix(home).ok()) {
         Some(rest) if rest.as_os_str().is_empty() => "~".into(),
         Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
@@ -213,7 +213,7 @@ fn display_path(path: &Path, home: Option<&Path>) -> String {
 /// How well `query` matches `text`: its characters, in order, ignoring
 /// case and spaces. Higher is better; `None` if they aren't all there.
 /// Characters next to each other and at the start of a word count most.
-fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
+pub fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
     let text: Vec<char> = text.to_lowercase().chars().collect();
     let mut score = 0;
     let mut next = 0;
