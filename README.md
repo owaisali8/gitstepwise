@@ -77,6 +77,8 @@ You need:
   to read your repository.
 - On Windows, the MSVC build tools (installed with Visual Studio or the Build Tools
   for Visual Studio), which Rust uses there anyway.
+- On Linux, the development libraries for xcb, FreeType and xkbcommon. On Debian
+  and Ubuntu: `sudo apt install libxcb1-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev`.
 
 Then:
 
@@ -96,8 +98,8 @@ cargo run --release -- src/main.rs README.md    # open files in tabs
 A path that doesn't exist yet opens as a new, empty file at that path.
 
 Gitstepwise is developed and tested on Windows. GPUI also runs on macOS and Linux,
-and the code handles both (Cmd shortcuts on macOS, your `$SHELL` in the terminal),
-but they haven't been tried yet.
+and the code handles both (Cmd shortcuts on macOS, your `$SHELL` in the terminal).
+It builds and its tests pass on Linux, but the app hasn't been tried on either yet.
 
 ## Reviewing an agent's changes
 
@@ -172,10 +174,11 @@ starts again from the new commit.
 | Path | What it holds |
 | --- | --- |
 | `src/main.rs` | The window: title bar and menus, tabs, editor, status bar and shortcuts |
-| `src/changes.rs` | The Changes tab: timeline, by-file and all-files review |
+| `src/changes.rs` | The Changes tab: timeline, by-file and all-files review, and commit history |
 | `src/timeline.rs` | The file watcher and the edit timeline |
 | `src/git.rs` | Reading the repository through the `git` command, and line diffs |
 | `src/explorer.rs` | The file explorer |
+| `src/file_icons.rs` | The explorer's icon and color for each kind of file |
 | `src/markdown.rs` | Where the Markdown preview's links and images lead |
 | `src/terminal.rs` | The integrated terminal |
 | `assets/` | The logo, the app icon, and `make-icon.ps1`, which rebuilds the icon |

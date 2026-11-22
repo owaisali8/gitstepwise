@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Gitstepwise is a small code editor in Rust on [GPUI Kit](https://crates.io/crates/gpui-kit) (`gpui-kit` 0.10, which wraps `gpui-component` and `gpui-base`) for reviewing uncommitted changes — for example a coding agent's — file by file or edit by edit before committing. It is developed and tested on Windows; macOS and Linux code paths exist but are untried.
+Gitstepwise is a small code editor in Rust on [GPUI Kit](https://crates.io/crates/gpui-kit) (`gpui-kit` 0.10, which wraps `gpui-component` and `gpui-base`) for reviewing uncommitted changes — for example a coding agent's — file by file or edit by edit before committing. It is developed and tested on Windows. On Linux it builds and its tests pass, but the app itself hasn't been tried there or on macOS.
 
 ## Commands
 
@@ -18,6 +18,7 @@ cargo clippy --all-targets -- -D warnings
 CI (`.github/workflows/ci.yml`, windows-latest) runs `cargo build --locked --all-targets`, `cargo test --locked` and `cargo clippy --locked --all-targets -- -D warnings`. Warnings fail CI, so keep clippy clean. After adding a dependency, run an unlocked build once so `Cargo.lock` is updated before `--locked` runs.
 
 - Git must be on `PATH`: all repository access shells out to `git`.
+- On Linux, GPUI links against xcb, freetype and xkbcommon. Without their development packages the build compiles but fails at linking (`unable to find library -lxkbcommon`). On Debian and Ubuntu, install `libxcb1-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev`.
 - `GITSTEPWISE_FPS=1` shows the frame rate in the status bar.
 - Release builds use `windows_subsystem = "windows"`, so there is no console and `eprintln!` output isn't visible. On Windows, a running `target\release\gitstepwise.exe` can't be overwritten by a rebuild; close it first.
 - `release.yml` builds and publishes a release when a `v*` tag is pushed; the tag must match the version in `Cargo.toml`.
@@ -33,14 +34,15 @@ It's one binary crate. `src/main.rs` holds `Workspace`, the root view, which own
 - **Repository state**: the `git::Repo` and the `Timeline`.
 
 **How the views talk:**
-- **Upward, by events:** child views emit events (`ExplorerEvent`, `ChangesEvent`, `TerminalEvent`) that `Workspace` subscribes to in `Workspace::new`.
+- **Upward, by events:** child views emit events (`ExplorerEvent`, `ChangesEvent`, `TerminalEvent`) that `Workspace` subscribes to in `Workspace::new`. The terminal is created on first use, so its subscription is made in `toggle_terminal`.
 - **Downward, by direct calls:** `Workspace` calls into child views with `entity.update(cx, ...)`.
 - **Rule:** new cross-view behavior goes through an event plus a `Workspace` handler. Child views don't hold references to each other.
 
 **Actions, keys and menus:**
 - **Actions:** each module declares its own with `gpui_kit::actions!` and binds keys in its `bind_keys`. `main.rs`'s `bind_keys` calls all of them.
-- **Key contexts:** each view has its own key context (`"TextEditor"` for the workspace). Bindings in a more specific context win, so the terminal keeps Ctrl+Shift+V for paste.
-- **Keystrokes:** `KeyBinding::new` needs `&'static str` and doesn't resolve `secondary-`. Build keystrokes with the `primary!` macro (`concat!`, Cmd on macOS and Ctrl elsewhere), not `format!`.
+- **Key contexts:** each view has its own key context: `"TextEditor"` for the workspace, and `"Explorer"`, `"Changes"` and `"Terminal"` inside it. The workspace's bindings apply in every child view too.
+- **Taking a key from an outer view:** a binding in a more specific context wins. Key bindings run before `on_key_down` handlers, and a handled action stops there. So a child view that wants a key an outer context binds must bind it in its own context; handling it in `on_key_down` isn't enough. That's why the terminal binds Tab (the window uses it to move focus) and Ctrl+Shift+V (`PasteClipboard`; the workspace binds it to the Markdown preview).
+- **Keystrokes:** `KeyBinding::new` needs `&'static str` and doesn't resolve `secondary-`. Build keystrokes with the `primary!` macro (`concat!`, Cmd on macOS and Ctrl elsewhere), not `format!`. It's defined separately in `main.rs` and `explorer.rs`, so a new module that needs it gets its own copy.
 - **Menus:** the View menu's check marks come from `MenuChecks`. `sync_menus` runs on every render and reinstalls the menus only when a check changes. A new checked or disabled menu state needs a field there.
 
 **Git (`git.rs`):**
@@ -69,7 +71,7 @@ It's one binary crate. `src/main.rs` holds `Workspace`, the root view, which own
 
 **Markdown preview:**
 - Each `Document` has a `Preview` mode and a `TextViewState`, updated from `InputEvent::Change`.
-- `markdown.rs` resolves links and images relative to the file: links starting with `/` start from the repository root, and `data:` images are cached.
+- `markdown.rs` resolves links and images relative to the file: links starting with `/` start from the repository root (or the explorer's folder outside a repository), and `data:` images are cached.
 - The `TextView` callbacks must be `Send + Sync`, so they can't capture the workspace. Link clicks reach it by dispatching the `OpenLinkedPath` action instead.
 
 **Icons:** only part of the Lucide set ships by default. Any other `LucideIcon` must be added to the `icon_assets!(ExtraIcons, [...])` list in `main.rs`, or it renders blank. The kit's defaults are listed in `default-icons.txt` in the `gpui-kit-assets` crate.
@@ -83,3 +85,5 @@ The API differs from upstream GPUI and from older gpui-component releases. Check
 - Doc comments, UI text and README are written in short, plain sentences that describe what the user sees.
 - Keep the README's feature list, shortcut tables and project layout table in step with changes.
 - Unit tests live in a `tests` module at the end of each file. Clippy rejects items after the test module.
+- In a file with `use gpui_kit::*`, the glob brings in GPUI's `test` attribute, which replaces `#[test]`. The test module there must import names one by one, not `use super::*` (see `explorer.rs`).
+- Some tests are platform-specific (`#[cfg(windows)]` / `#[cfg(not(windows))]`), so the test count differs between Windows and other systems.
