@@ -30,7 +30,7 @@ CI (`.github/workflows/ci.yml`, windows-latest) runs `cargo build --locked --all
 It's one binary crate. `src/main.rs` holds `Workspace`, the root view, which owns everything else:
 
 - **Documents**: one tab per open file, each with its own `EditorState`.
-- **Child views**: `Explorer`, `ChangesView` and the optional `TerminalPanel`, which holds a `TerminalView` for each split terminal.
+- **Child views**: `Explorer`, `ChangesView`, the optional `TerminalPanel` (which holds a `TerminalView` for each split terminal), and the `ProjectPicker` while it shows.
 - **Repository state**: the `git::Repo` and the `Timeline`.
 
 **How the views talk:**
@@ -54,6 +54,7 @@ It's one binary crate. `src/main.rs` holds `Workspace`, the root view, which own
 - A `notify` watcher records every write to the repository's tracked or trackable files as a step. Quick bursts of writes are merged.
 - The timeline is stored in `.git/gitstepwise/timeline.json`; the legacy `.git/gpui-editor/` location is still read.
 - It starts afresh when HEAD changes. Reviewed flags live on the steps.
+- `Workspace::timelines` keeps every repository's timeline shown in a session, by root. They keep recording while another project shows, and `check_head` runs when one shows again.
 
 **Changes view (`changes.rs`):**
 - Modes: Timeline, ByFile, AllFiles and History.
@@ -74,6 +75,12 @@ It's one binary crate. `src/main.rs` holds `Workspace`, the root view, which own
 - A new shell needs the workspace's starting folder. So splitting goes through the workspace: the header's buttons emit `TerminalPanelEvent::Split`, and the `SplitRight` and `SplitDown` actions bubble up to `Workspace`. Moving between terminals and closing them happen in the panel.
 - The tree logic and `neighbor` (moving by direction) are generic, so the tests use plain numbers.
 - Closing the last terminal emits `Closed`, and the workspace drops the panel. Dropping a `TerminalView` ends its shell.
+
+**Projects (`projects.rs`):**
+- A project is a folder opened with Open Folder, the picker, or as a command-line folder. `Projects` is a GPUI global, loaded in `main` and saved to `projects.json` in the config folder (`dirs::config_dir()`).
+- `Workspace::sync_project_session` runs on every render, like `sync_menus`. It records the open files in the list and saves only when they change.
+- `open_project` asks about unsaved changes with `confirm_close_all`, then `switch_project` swaps the tabs for the ones remembered. The old project's `TerminalPanel` is parked in `parked_terminals` and comes back with it. Events from a parked panel are ignored, except `Closed`.
+- `ProjectPicker` wraps the kit's searchable `ListState`. It leaves out the project showing, so Enter goes back to the previous one.
 
 **Markdown preview:**
 - Each `Document` has a `Preview` mode and a `TextViewState`, updated from `InputEvent::Change`.

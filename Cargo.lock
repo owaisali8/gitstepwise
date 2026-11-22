@@ -1947,6 +1947,7 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "data-url",
+ "dirs 6.0.0",
  "embed-resource",
  "futures",
  "gpui-kit",

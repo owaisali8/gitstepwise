@@ -46,6 +46,18 @@ was made. Step through until you've seen everything, then commit.
   commits on the branch, newest first, and what each one changed. Right-click a
   file or folder and choose **View History** for only the commits that touched it.
 
+**Projects**
+
+- Open a folder and it becomes a project. Switch to another, as in Zed, with
+  the project's name in the title bar, File → Open Recent…, or Ctrl+Alt+O:
+  type to narrow the list, then Enter.
+- Each project remembers the files open in it. They open again when you come
+  back to it, or when Gitstepwise starts without a folder or file to open.
+- A project's terminals keep running while another project shows, and its edit
+  timeline keeps recording.
+- The list is kept in `projects.json` in your config folder
+  (`%APPDATA%\Gitstepwise` on Windows).
+
 **The explorer**
 
 - Icons for each kind of file, in their own colors.
@@ -99,7 +111,8 @@ cargo run --release -- path/to/your/repo        # show a folder in the explorer
 cargo run --release -- src/main.rs README.md    # open files in tabs
 ```
 
-A path that doesn't exist yet opens as a new, empty file at that path.
+A path that doesn't exist yet opens as a new, empty file at that path. With
+nothing given, the last project opens again.
 
 Gitstepwise is developed and tested on Windows. GPUI also runs on macOS and Linux,
 and the code handles both (Cmd shortcuts on macOS, your `$SHELL` in the terminal).
@@ -125,6 +138,7 @@ On macOS, use Cmd in place of Ctrl.
 | --- | --- |
 | New file / Open file | Ctrl+N / Ctrl+O |
 | Open folder | Ctrl+K, then Ctrl+O |
+| Switch project | Ctrl+Alt+O |
 | Save / Save as | Ctrl+S / Ctrl+Shift+S |
 | Close tab | Ctrl+W |
 | Next / previous tab | Ctrl+Tab / Ctrl+Shift+Tab (or Ctrl+PageDown / Ctrl+PageUp) |
@@ -193,6 +207,7 @@ starts again from the new commit.
 | `src/explorer.rs` | The file explorer |
 | `src/file_icons.rs` | The explorer's icon and color for each kind of file |
 | `src/markdown.rs` | Where the Markdown preview's links and images lead |
+| `src/projects.rs` | The list of projects and the picker to switch between them |
 | `src/terminal.rs` | The integrated terminal |
 | `src/terminal_panel.rs` | The terminal panel: split terminals and their header |
 | `assets/` | The logo, the app icon, and `make-icon.ps1`, which rebuilds the icon |

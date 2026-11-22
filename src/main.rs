@@ -15,11 +15,13 @@ mod explorer;
 mod file_icons;
 mod git;
 mod markdown;
+mod projects;
 mod terminal;
 mod terminal_panel;
 mod timeline;
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -43,6 +45,7 @@ use changes::{ChangedFile, ChangesEvent, ChangesView, Mode, Select};
 use timeline::Timeline;
 use explorer::{Explorer, ExplorerEvent};
 use markdown::{EmbeddedImages, Links, Target};
+use projects::{ProjectPicker, ProjectPickerEvent, Projects};
 use terminal_panel::{SplitDown, SplitRight, TerminalPanel, TerminalPanelEvent};
 
 gpui_kit::actions!(
@@ -51,6 +54,8 @@ gpui_kit::actions!(
         NewFile,
         OpenFile,
         OpenFolder,
+        /// Switch to another project: the picker of recent folders.
+        OpenRecent,
         ToggleSidebar,
         ToggleChanges,
         ReviewChanges,
@@ -218,6 +223,7 @@ fn app_menus(checks: MenuChecks) -> Vec<Menu> {
             MenuItem::action("New File", NewFile),
             MenuItem::action("Open File…", OpenFile),
             MenuItem::action("Open Folder…", OpenFolder),
+            MenuItem::action("Open Recent…", OpenRecent),
             MenuItem::separator(),
             MenuItem::action("Save", SaveFile),
             MenuItem::action("Save As…", SaveFileAs),
@@ -267,6 +273,14 @@ fn app_menus(checks: MenuChecks) -> Vec<Menu> {
             MenuItem::action("Dark Theme", UseDarkTheme).checked(checks.dark),
         ]),
     ]
+}
+
+/// A project's terminals, kept running while another project shows.
+struct ParkedTerminal {
+    folder: PathBuf,
+    panel: Entity<TerminalPanel>,
+    visible: bool,
+    _subscription: Option<Subscription>,
 }
 
 /// A step that runs once unsaved changes have been saved or discarded.
@@ -437,6 +451,16 @@ struct Workspace {
     repo: Option<git::Repo>,
     /// Every edit to the repository's files, in order, since the last commit.
     timeline: Option<Entity<Timeline>>,
+    /// The timeline of every repository shown so far, by its root. They keep
+    /// recording while another project shows.
+    timelines: HashMap<PathBuf, Entity<Timeline>>,
+    /// The terminals of the other projects opened.
+    parked_terminals: Vec<ParkedTerminal>,
+    /// The list of projects to switch to, while it shows.
+    project_picker: Option<(Entity<ProjectPicker>, Subscription)>,
+    /// The project folder, its open files and the one showing, as last
+    /// remembered in the list of projects.
+    last_session: Option<(PathBuf, Vec<PathBuf>, Option<PathBuf>)>,
     /// Last seen modification times in `.git`, to notice commits and staging.
     repo_stamp: Option<Vec<Option<SystemTime>>>,
     branch: Option<SharedString>,
@@ -456,12 +480,27 @@ struct Workspace {
 impl Workspace {
     fn new(paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         // The explorer shows the first folder given, else the first file's
-        // folder, else the current directory.
+        // folder. Given nothing, it reopens the last project, else shows the
+        // current directory. A folder given or reopened is a project: it goes
+        // first in the list of projects, and with no files given, the files
+        // last open in it open again.
+        let nothing_given = paths.is_empty();
         let (folders, files): (Vec<PathBuf>, Vec<PathBuf>) =
             paths.into_iter().partition(|path| path.is_dir());
-        let root = folders
-            .first()
-            .cloned()
+        let last_project = || {
+            cx.global::<Projects>()
+                .list()
+                .iter()
+                .map(|project| project.path.clone())
+                .find(|path| path.is_dir())
+        };
+        let project = match folders.first() {
+            Some(folder) => Some(std::path::absolute(folder).unwrap_or_else(|_| folder.clone())),
+            None if nothing_given => last_project(),
+            None => None,
+        };
+        let root = project
+            .clone()
             .or_else(|| {
                 files
                     .first()
@@ -523,6 +562,10 @@ impl Workspace {
             menu_checks: None,
             repo: None,
             timeline: None,
+            timelines: HashMap::new(),
+            parked_terminals: Vec::new(),
+            project_picker: None,
+            last_session: None,
             repo_stamp: None,
             branch: None,
             changed_files: 0,
@@ -537,6 +580,15 @@ impl Workspace {
         };
         this.sync_menus(cx);
 
+        if let Some(project) = &project {
+            cx.update_global::<Projects, _>(|projects, _| {
+                projects.opened(project.clone(), projects::now_ms());
+                projects.save();
+            });
+            if files.is_empty() {
+                this.restore_session(project, window, cx);
+            }
+        }
         for path in files {
             this.open_path(path, window, cx);
         }
@@ -706,9 +758,159 @@ impl Workspace {
             let Some(folder) = paths.into_iter().next() else {
                 return;
             };
-            this.update(cx, |this, cx| this.show_folder(folder, cx)).ok();
+            this.update_in(cx, |this, window, cx| this.open_project(folder, window, cx))
+                .ok();
         })
         .detach();
+    }
+
+    // ---- Projects ----------------------------------------------------------
+
+    /// Open `folder` as the project: ask about unsaved changes, then swap
+    /// the tabs for the ones last open in it.
+    fn open_project(&mut self, folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let folder = std::path::absolute(&folder).unwrap_or(folder);
+        if !folder.is_dir() {
+            self.set_status(format!("{} isn't there any more.", folder.display()), true, cx);
+            return;
+        }
+        if projects::same_folder(&folder, &self.default_folder(cx)) {
+            // Already showing: it only becomes a project, if it wasn't one.
+            self.remember_opened(folder, cx);
+            self.sidebar_visible = true;
+            cx.notify();
+            return;
+        }
+        self.confirm_close_all(
+            window,
+            cx,
+            Box::new(move |this, window, cx| this.switch_project(folder, window, cx)),
+        );
+    }
+
+    /// Put `folder` first in the list of projects.
+    fn remember_opened(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+        cx.update_global::<Projects, _>(|projects, _| {
+            projects.opened(folder, projects::now_ms());
+            projects.save();
+        });
+    }
+
+    /// Show `folder` in place of the project showing. Its unsaved changes
+    /// have been saved or discarded by now. Its terminals keep running, to
+    /// come back with it.
+    fn switch_project(&mut self, folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let old = self.default_folder(cx);
+        if let Some(panel) = self.terminal.take() {
+            self.parked_terminals.push(ParkedTerminal {
+                folder: old,
+                panel,
+                visible: self.terminal_visible,
+                _subscription: self._terminal_subscription.take(),
+            });
+        }
+        self.terminal_visible = false;
+        let parked = self
+            .parked_terminals
+            .iter()
+            .position(|parked| projects::same_folder(&parked.folder, &folder));
+        if let Some(ix) = parked {
+            let parked = self.parked_terminals.remove(ix);
+            self.terminal = Some(parked.panel);
+            self._terminal_subscription = parked._subscription;
+            self.terminal_visible = parked.visible;
+        }
+
+        self.documents.clear();
+        self.active = 0;
+        self.changes_open = false;
+        self.changes_active = false;
+        self.explorer
+            .update(cx, |explorer, cx| explorer.set_root(folder.clone(), cx));
+        self.sidebar_visible = true;
+        self.remember_opened(folder.clone(), cx);
+        self.restore_session(&folder, window, cx);
+        self.refresh_repo(cx);
+        self.show_active(window, cx);
+        self.set_status(format!("Opened {}", folder.display()), false, cx);
+    }
+
+    /// Open the files that were open in the project at `folder` the last
+    /// time, and show the one that was showing.
+    fn restore_session(&mut self, folder: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = cx.global::<Projects>().get(folder).cloned() else {
+            return;
+        };
+        for file in project.files.iter().filter(|file| file.is_file()) {
+            self.open_path(file.clone(), window, cx);
+        }
+        let active = project.active.and_then(|active| {
+            self.documents
+                .iter()
+                .position(|doc| doc.path.as_deref() == Some(active.as_path()))
+        });
+        if let Some(ix) = active {
+            self.activate(ix, window, cx);
+        }
+    }
+
+    /// Keep the list of projects up to date with the files open in this
+    /// one. Runs on every render, and writes only when they change.
+    fn sync_project_session(&mut self, cx: &mut Context<Self>) {
+        let folder = self.default_folder(cx);
+        let files: Vec<PathBuf> = self.documents.iter().filter_map(|doc| doc.path.clone()).collect();
+        let active = self.active_document().and_then(|doc| doc.path.clone());
+        if let Some((last_folder, last_files, last_active)) = &self.last_session
+            && *last_folder == folder
+            && *last_files == files
+            && *last_active == active
+        {
+            return;
+        }
+        let changed = cx.update_global::<Projects, _>(|projects, _| {
+            projects.set_session(&folder, &files, active.as_deref())
+        });
+        self.last_session = Some((folder, files, active));
+        if changed {
+            // Not while drawing.
+            cx.defer(|cx| cx.global::<Projects>().save());
+        }
+    }
+
+    /// Show the list of projects to switch to, or close it.
+    fn open_recent(&mut self, _: &OpenRecent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.project_picker.is_some() {
+            self.close_picker(window, cx);
+            return;
+        }
+        let current = self.default_folder(cx);
+        let picker = cx.new(|cx| ProjectPicker::new(&current, window, cx));
+        let subscription = cx.subscribe_in(&picker, window, Self::on_picker_event);
+        picker.read(cx).focus_handle(cx).focus(window, cx);
+        self.project_picker = Some((picker, subscription));
+        cx.notify();
+    }
+
+    fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.project_picker.take().is_some() {
+            self.focus_active(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn on_picker_event(
+        &mut self,
+        _: &Entity<ProjectPicker>,
+        event: &ProjectPickerEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_picker(window, cx);
+        match event {
+            ProjectPickerEvent::Open(folder) => self.open_project(folder.clone(), window, cx),
+            ProjectPickerEvent::OpenFolder => self.open_folder(&OpenFolder, window, cx),
+            ProjectPickerEvent::Dismissed => {}
+        }
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, window: &mut Window, cx: &mut Context<Self>) {
@@ -1225,9 +1427,18 @@ impl Workspace {
             this.update(cx, |this, cx| {
                 if this.repo != repo {
                     this.repo_stamp = repo.as_ref().map(git::Repo::stamp);
-                    this.timeline = repo
-                        .clone()
-                        .map(|repo| cx.new(|cx| Timeline::new(repo, cx)));
+                    // A repository shown before still has its timeline, which
+                    // kept recording; it may have missed a commit meanwhile.
+                    this.timeline = repo.clone().map(|repo| {
+                        if let Some(timeline) = this.timelines.get(&repo.root) {
+                            timeline.update(cx, |timeline, cx| timeline.check_head(cx));
+                            return timeline.clone();
+                        }
+                        let root = repo.root.clone();
+                        let timeline = cx.new(|cx| Timeline::new(repo, cx));
+                        this.timelines.insert(root, timeline.clone());
+                        timeline
+                    });
                     this.repo = repo.clone();
                     let timeline = this.timeline.clone();
                     this.changes.update(cx, |view, cx| {
@@ -1655,11 +1866,18 @@ impl Workspace {
 
     fn on_terminal_event(
         &mut self,
-        _: &Entity<TerminalPanel>,
+        panel: &Entity<TerminalPanel>,
         event: &TerminalPanelEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.terminal.as_ref() != Some(panel) {
+            // Another project's: when its last shell ends, it goes.
+            if matches!(event, TerminalPanelEvent::Closed) {
+                self.parked_terminals.retain(|parked| &parked.panel != panel);
+            }
+            return;
+        }
         match event {
             TerminalPanelEvent::Split(axis) => self.split_terminal(*axis, window, cx),
             TerminalPanelEvent::Hide => self.hide_terminal(window, cx),
@@ -1898,7 +2116,9 @@ impl Workspace {
                     .child(div().flex_none().h_full().child(self.menu_bar.clone()))
                     .child(
                         div()
+                            .h_flex()
                             .flex_none()
+                            .gap_1()
                             // The title bar moves the window when pressed: claim
                             // the press so it clicks the button instead.
                             .on_mouse_down(MouseButton::Left, |_, window, cx| {
@@ -1913,6 +2133,19 @@ impl Workspace {
                                     .tooltip(format!("{sidebar_tooltip} ({})", shortcut("B")))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.toggle_sidebar(&ToggleSidebar, window, cx)
+                                    })),
+                            )
+                            // The project's name; click to switch to another.
+                            .child(
+                                Button::new("switch-project")
+                                    .ghost()
+                                    .xsmall()
+                                    .label(projects::folder_name(&self.default_folder(cx)))
+                                    .dropdown_caret(true)
+                                    .selected(self.project_picker.is_some())
+                                    .tooltip(format!("Switch project ({})", shortcut("Alt+O")))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_recent(&OpenRecent, window, cx)
                                     })),
                             ),
                     ),
@@ -2259,6 +2492,7 @@ impl Render for Workspace {
         }
         // Covers every way a checked setting changes, the system theme included.
         self.sync_menus(cx);
+        self.sync_project_session(cx);
 
         let theme = cx.theme();
         let (background, foreground, border, sidebar_bg, accent) = (
@@ -2319,6 +2553,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::new_file))
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::open_folder))
+            .on_action(cx.listener(Self::open_recent))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_changes))
             .on_action(cx.listener(Self::review_changes))
@@ -2409,6 +2644,19 @@ impl Render for Workspace {
                     ),
             )
             .child(self.render_status_bar(cx))
+            // The list of projects, over everything near the top, as in Zed.
+            .when_some(self.project_picker.as_ref(), |root, (picker, _)| {
+                root.child(
+                    div()
+                        .absolute()
+                        .top(px(48.))
+                        .left_0()
+                        .right_0()
+                        .h_flex()
+                        .justify_center()
+                        .child(picker.clone()),
+                )
+            })
     }
 }
 
@@ -2433,6 +2681,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(primary!("n"), NewFile, context),
         KeyBinding::new(primary!("o"), OpenFile, context),
         KeyBinding::new(concat!(primary!("k"), " ", primary!("o")), OpenFolder, context),
+        KeyBinding::new(primary!("alt-o"), OpenRecent, context),
         KeyBinding::new(primary!("b"), ToggleSidebar, context),
         KeyBinding::new(primary!("shift-g"), ToggleChanges, context),
         KeyBinding::new(primary!("shift-e"), FocusExplorer, context),
@@ -2470,6 +2719,7 @@ fn main() {
         .run(move |cx| {
             gpui_kit::init(cx);
             bind_keys(cx);
+            cx.set_global(Projects::load());
 
             // Closing the last window ends the app.
             cx.on_window_closed(|cx, _| {
