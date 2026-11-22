@@ -154,6 +154,143 @@ impl Repo {
         let parts: Vec<_> = relative.iter().map(|part| part.to_string_lossy()).collect();
         Some(parts.join("/"))
     }
+
+    /// The latest `limit` commits on the checked-out branch, newest first;
+    /// only those that touch `path` (a file or folder, relative) if given.
+    pub fn log(&self, path: Option<&str>, limit: usize) -> Vec<Commit> {
+        let mut command = git(&self.root);
+        // Fields end in 0x1f and commits in 0x1e, which messages never contain.
+        command
+            .args(["log", "--format=%H%x1f%h%x1f%an%x1f%at%x1f%s%x1e"])
+            .arg(format!("-n{limit}"));
+        if let Some(path) = path {
+            command.arg("--").arg(path);
+        }
+        let Some(text) = run_text(&mut command) else {
+            return Vec::new();
+        };
+        text.split('\x1e')
+            .filter_map(|record| {
+                let mut fields = record.trim_start_matches(['\n', '\r']).split('\x1f');
+                Some(Commit {
+                    id: fields.next()?.to_string(),
+                    short_id: fields.next()?.to_string(),
+                    author: fields.next()?.to_string(),
+                    time: fields.next()?.trim().parse().ok()?,
+                    subject: fields.next()?.to_string(),
+                })
+            })
+            .collect()
+    }
+
+    /// One patch per file `commit` changed, against its first parent (or
+    /// against nothing, for the first commit); only for `path` if given.
+    /// At most `limit` files; the second value says whether there were more.
+    pub fn commit_patches(&self, commit: &str, path: Option<&str>, limit: usize) -> (Vec<String>, bool) {
+        let parent = run_text(git(&self.root).args(["rev-parse", "-q", "--verify"]).arg(format!("{commit}^1")))
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
+        let mut command = git(&self.root);
+        match &parent {
+            Some(parent) => command.args(["diff", "--name-only", "-z", "--no-renames", parent.as_str(), commit]),
+            None => command.args([
+                "diff-tree",
+                "-r",
+                "--root",
+                "--no-commit-id",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                commit,
+            ]),
+        };
+        if let Some(path) = path {
+            command.arg("--").arg(path);
+        }
+        let Some(output) = run(&mut command) else {
+            return (Vec::new(), false);
+        };
+        let paths: Vec<&str> = output
+            .split(|byte| *byte == 0)
+            .filter_map(|path| std::str::from_utf8(path).ok())
+            .filter(|path| !path.is_empty())
+            .collect();
+        let patches = paths
+            .iter()
+            .take(limit)
+            .filter_map(|path| {
+                let old = parent.as_deref().and_then(|parent| self.blob(parent, path));
+                file_patch(path, old, self.blob(commit, path))
+            })
+            .collect();
+        (patches, paths.len() > limit)
+    }
+
+    /// A file's contents at a commit, or `None` if it isn't there.
+    fn blob(&self, commit: &str, relative: &str) -> Option<Vec<u8>> {
+        run(git(&self.root).args(["cat-file", "blob"]).arg(format!("{commit}:{relative}")))
+    }
+
+    /// A link to `relative` at commit `commit` on the `origin` remote's
+    /// website, for GitHub and GitLab remotes.
+    pub fn permalink(&self, commit: &str, relative: &str) -> Result<String, String> {
+        let remote = run_text(git(&self.root).args(["remote", "get-url", "origin"]))
+            .map(|url| url.trim().to_string())
+            .ok_or("The repository has no \"origin\" remote.")?;
+        let site = web_url(&remote).ok_or_else(|| format!("Links aren't supported for the remote {remote}."))?;
+        let path = relative.split('/').map(percent_encode).collect::<Vec<_>>().join("/");
+        if site.starts_with("https://github.com/") {
+            Ok(format!("{site}/blob/{commit}/{path}"))
+        } else if site.starts_with("https://gitlab.com/") {
+            Ok(format!("{site}/-/blob/{commit}/{path}"))
+        } else {
+            Err(format!("Links are only made for GitHub and GitLab remotes, not {site}."))
+        }
+    }
+}
+
+/// One commit in the history.
+#[derive(Clone, Debug)]
+pub struct Commit {
+    pub id: String,
+    pub short_id: String,
+    pub author: String,
+    /// Seconds since the Unix epoch.
+    pub time: i64,
+    pub subject: String,
+}
+
+/// The website of a remote: `git@github.com:owner/repo.git`,
+/// `ssh://git@github.com/owner/repo` and `https://github.com/owner/repo.git`
+/// all give `https://github.com/owner/repo`.
+fn web_url(remote: &str) -> Option<String> {
+    let rest = if let Some(rest) = remote.strip_prefix("https://").or_else(|| remote.strip_prefix("http://")) {
+        rest.to_string()
+    } else if let Some(rest) = remote.strip_prefix("ssh://") {
+        rest.to_string()
+    } else {
+        // scp-like: user@host:owner/repo
+        let (host, path) = remote.split_once(':')?;
+        format!("{host}/{path}")
+    };
+    // Drop any user name, then any port.
+    let rest = rest.rsplit_once('@').map_or(rest.as_str(), |(_, rest)| rest);
+    let (host, path) = rest.split_once('/')?;
+    let host = host.split(':').next()?;
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    // A local path like C:/repos/x isn't a website.
+    (host.contains('.') && !path.starts_with('/') && path.contains('/')).then(|| format!("https://{host}/{path}"))
+}
+
+/// Percent-encode one path segment for a URL.
+fn percent_encode(segment: &str) -> String {
+    segment
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (byte as char).to_string(),
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
 }
 
 /// The text of `file` in the last commit, or `None` when it isn't committed
@@ -325,6 +462,17 @@ mod tests {
 
     fn kinds(base: &str, text: &str) -> Vec<(MarkerKind, Range<usize>)> {
         markers(base, text).into_iter().map(|m| (m.kind, m.range)).collect()
+    }
+
+    #[test]
+    fn remotes_map_to_their_websites() {
+        let site = "https://github.com/owner/repo";
+        assert_eq!(web_url("https://github.com/owner/repo.git").as_deref(), Some(site));
+        assert_eq!(web_url("git@github.com:owner/repo.git").as_deref(), Some(site));
+        assert_eq!(web_url("ssh://git@github.com:22/owner/repo").as_deref(), Some(site));
+        assert_eq!(web_url("https://user@github.com/owner/repo/").as_deref(), Some(site));
+        assert_eq!(web_url("C:/some/folder"), None);
+        assert_eq!(percent_encode("a b#c.rs"), "a%20b%23c.rs");
     }
 
     #[test]

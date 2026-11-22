@@ -12,6 +12,7 @@
 
 mod changes;
 mod explorer;
+mod file_icons;
 mod git;
 mod terminal;
 mod timeline;
@@ -49,6 +50,7 @@ gpui_kit::actions!(
         ToggleChanges,
         ReviewChanges,
         ShowTimeline,
+        ShowHistory,
         FocusExplorer,
         SaveFile,
         SaveFileAs,
@@ -82,7 +84,29 @@ const MAX_FONT_SIZE: Pixels = px(40.);
 const FONT_SIZE_STEP: Pixels = px(1.);
 
 // Icons beyond the kit's default set, embedded on top of it.
-gpui_kit::assets::icon_assets!(ExtraIcons, [Circle, FilePlus, FolderPlus, GitBranch]);
+gpui_kit::assets::icon_assets!(
+    ExtraIcons,
+    [
+        BookOpen,
+        Circle,
+        Database,
+        FileArchive,
+        FileBraces,
+        FileCode,
+        FileCog,
+        FileImage,
+        FileKey,
+        FileLock,
+        FilePlus,
+        FileSpreadsheet,
+        FileTerminal,
+        FileText,
+        FolderPlus,
+        GitBranch,
+        Package,
+        Scale,
+    ]
+);
 
 struct AppAssets;
 
@@ -198,6 +222,7 @@ fn app_menus(checks: MenuChecks) -> Vec<Menu> {
             MenuItem::action("Changes", ToggleChanges).checked(checks.changes),
             MenuItem::action("Review Changes Step by Step", ReviewChanges),
             MenuItem::action("Edit Timeline", ShowTimeline),
+            MenuItem::action("Commit History", ShowHistory),
             MenuItem::action("Terminal", ToggleTerminal).checked(checks.terminal),
             MenuItem::separator(),
             MenuItem::action("Word Wrap", ToggleSoftWrap).checked(checks.soft_wrap),
@@ -471,7 +496,106 @@ impl Workspace {
     ) {
         match event {
             ExplorerEvent::OpenFile(path) => self.open_path(path.clone(), window, cx),
+            ExplorerEvent::Renamed { from, to } => self.on_renamed(from, to, window, cx),
+            ExplorerEvent::Removed(path) => self.on_removed(path, window, cx),
+            ExplorerEvent::OpenTerminal(dir) => self.open_terminal_in(dir.clone(), window, cx),
+            ExplorerEvent::ViewHistory(path) => {
+                let relative = self
+                    .repo
+                    .as_ref()
+                    .and_then(|repo| repo.relative(path))
+                    .filter(|relative| !relative.is_empty());
+                self.changes
+                    .update(cx, |view, cx| view.show_history(relative, cx));
+                self.show_changes(None, window, cx);
+            }
+            ExplorerEvent::Permalink { path, open } => self.permalink(path, *open, cx),
+            ExplorerEvent::Status { message, is_error } => self.set_status(message.clone(), *is_error, cx),
+            ExplorerEvent::GitChanged => self.refresh_git(cx),
         }
+    }
+
+    /// A file or folder moved: tabs showing it, or files inside it, follow.
+    fn on_renamed(&mut self, from: &Path, to: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let mut moved = Vec::new();
+        for doc in &mut self.documents {
+            let Some(path) = doc.path.as_deref() else {
+                continue;
+            };
+            let Ok(rest) = path.strip_prefix(from) else {
+                continue;
+            };
+            let new_path = if rest.as_os_str().is_empty() {
+                to.to_path_buf()
+            } else {
+                to.join(rest)
+            };
+            // A new extension may mean a new language.
+            let language = language_for(&new_path);
+            if doc.editor.read(cx).language_name() != language {
+                doc.editor.update(cx, |state, cx| state.set_highlighter(language, cx));
+            }
+            doc.path = Some(new_path);
+            moved.push(doc.id);
+        }
+        for id in moved {
+            self.load_base(id, cx);
+        }
+        self.update_title(window);
+        self.sync_explorer(cx);
+        self.refresh_changes(cx);
+        cx.notify();
+    }
+
+    /// A file or folder was deleted: close its tabs, unless they have unsaved
+    /// changes (those stay open, to be saved again or discarded).
+    fn on_removed(&mut self, removed: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let ids: Vec<DocId> = self
+            .documents
+            .iter()
+            .filter(|doc| !doc.dirty && doc.path.as_deref().is_some_and(|path| path.starts_with(removed)))
+            .map(|doc| doc.id)
+            .collect();
+        for id in ids {
+            self.close_document(id, window, cx);
+        }
+        self.refresh_changes(cx);
+    }
+
+    /// Open, or copy, a link to a file as it is in the last commit, on the
+    /// remote's website.
+    fn permalink(&mut self, path: &Path, open: bool, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let Some(relative) = repo.relative(path) else {
+            self.set_status(format!("{} isn't in the repository.", path.display()), true, cx);
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let link = cx
+                .background_spawn(async move {
+                    let head = repo.head().ok_or("Nothing has been committed yet.")?;
+                    let url = repo.permalink(&head, &relative)?;
+                    Ok::<_, String>((url, head))
+                })
+                .await;
+            this.update(cx, |this, cx| match link {
+                Ok((url, head)) => {
+                    let short = &head[..head.len().min(7)];
+                    if open {
+                        cx.open_url(&url);
+                        this.set_status(format!("Opened the link to commit {short}: {url}"), false, cx);
+                    } else {
+                        cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                        this.set_status(format!("Copied the link to commit {short}: {url}"), false, cx);
+                    }
+                }
+                Err(err) => this.set_status(err, true, cx),
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Tell the explorer which file the active tab shows.
@@ -1011,12 +1135,14 @@ impl Workspace {
                     this.timeline = repo
                         .clone()
                         .map(|repo| cx.new(|cx| Timeline::new(repo, cx)));
-                    this.repo = repo;
+                    this.repo = repo.clone();
                     let timeline = this.timeline.clone();
                     this.changes.update(cx, |view, cx| {
                         view.set_loading(cx);
                         view.set_timeline(timeline, cx);
+                        view.set_repo(repo.clone(), cx);
                     });
+                    this.explorer.update(cx, |explorer, cx| explorer.set_repo(repo, cx));
                 }
                 this.refresh_changes(cx);
             })
@@ -1033,10 +1159,11 @@ impl Workspace {
         if self.repo_stamp != stamp {
             self.repo_stamp = stamp;
             self.refresh_git(cx);
-            // A commit starts a new timeline.
+            // A commit starts a new timeline, and adds to the history.
             if let Some(timeline) = &self.timeline {
                 timeline.update(cx, |timeline, cx| timeline.check_head(cx));
             }
+            self.changes.update(cx, |view, cx| view.refresh_history(cx));
         }
     }
 
@@ -1263,6 +1390,12 @@ impl Workspace {
         self.show_changes(None, window, cx);
     }
 
+    /// The commits already made, and what each one changed.
+    fn show_commit_history(&mut self, _: &ShowHistory, window: &mut Window, cx: &mut Context<Self>) {
+        self.changes.update(cx, |view, cx| view.show_history(None, cx));
+        self.show_changes(None, window, cx);
+    }
+
     /// Open the Changes tab, or switch to it, and bring its changes up to date.
     fn show_changes(&mut self, select: Option<Select>, window: &mut Window, cx: &mut Context<Self>) {
         self.changes_open = true;
@@ -1333,26 +1466,49 @@ impl Workspace {
                 .and_then(Path::parent)
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| self.default_folder(cx));
-            let working_directory = Some(working_directory);
-            match terminal::start_shell(working_directory) {
-                Ok(shell) => {
-                    let view = cx.new(|cx| TerminalView::new(shell, cx));
-                    self._terminal_subscription =
-                        Some(cx.subscribe_in(&view, window, Self::on_terminal_event));
-                    self.terminal = Some(view);
-                }
-                Err(err) => {
-                    self.set_status(format!("Couldn't start a terminal: {err}"), true, cx);
-                    return;
-                }
+            if !self.start_terminal(working_directory, window, cx) {
+                return;
             }
         }
+        self.show_terminal(window, cx);
+    }
 
+    /// Start a shell in `working_directory`. Returns whether it started.
+    fn start_terminal(&mut self, working_directory: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        match terminal::start_shell(Some(working_directory)) {
+            Ok(shell) => {
+                let view = cx.new(|cx| TerminalView::new(shell, cx));
+                self._terminal_subscription = Some(cx.subscribe_in(&view, window, Self::on_terminal_event));
+                self.terminal = Some(view);
+                true
+            }
+            Err(err) => {
+                self.set_status(format!("Couldn't start a terminal: {err}"), true, cx);
+                false
+            }
+        }
+    }
+
+    fn show_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.terminal_visible = true;
         if let Some(terminal) = &self.terminal {
             terminal.read(cx).focus_handle(cx).focus(window, cx);
         }
         cx.notify();
+    }
+
+    /// Show the terminal in `dir`: a new shell there, or the running one
+    /// moved there.
+    fn open_terminal_in(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.terminal {
+            Some(terminal) => terminal.update(cx, |terminal, cx| terminal.change_directory(&dir, cx)),
+            None => {
+                if !self.start_terminal(dir, window, cx) {
+                    return;
+                }
+            }
+        }
+        self.show_terminal(window, cx);
     }
 
     /// End the shell and remove the panel.
@@ -1902,6 +2058,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_changes))
             .on_action(cx.listener(Self::review_changes))
             .on_action(cx.listener(Self::show_timeline))
+            .on_action(cx.listener(Self::show_commit_history))
             .on_action(cx.listener(Self::focus_explorer))
             .on_action(cx.listener(Self::save_file))
             .on_action(cx.listener(Self::save_file_as))

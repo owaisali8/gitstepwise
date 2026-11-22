@@ -2,7 +2,7 @@
 //! Windows), emulated by `alacritty_terminal` and painted cell by cell.
 
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use alacritty_terminal::event::{
@@ -212,6 +212,19 @@ impl TerminalView {
     /// The title the shell set, if any.
     pub fn title(&self) -> Option<SharedString> {
         self.title.clone()
+    }
+
+    /// Move the shell to `dir`, by typing the command for it. (A program
+    /// running in the shell gets the text instead.)
+    pub fn change_directory(&mut self, dir: &Path, cx: &mut Context<Self>) {
+        let dir = dir.display().to_string();
+        // Quoted for the shell `start_shell` runs: PowerShell on Windows.
+        let command = if cfg!(target_os = "windows") {
+            format!("Set-Location -LiteralPath '{}'\r", dir.replace('\'', "''"))
+        } else {
+            format!("cd -- '{}'\r", dir.replace('\'', r"'\''"))
+        };
+        self.input(command.into_bytes(), cx);
     }
 
     fn handle_event(&mut self, event: TermEvent, cx: &mut Context<Self>) {

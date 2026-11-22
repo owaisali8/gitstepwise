@@ -4,6 +4,8 @@
 //!   editing a file, then another, then the first again is three steps.
 //! - **By file**: each changed file against the last commit, one at a time.
 //! - **All files**: every changed file in one list.
+//! - **History**: the commits already made, newest first, and what each one
+//!   changed; or only those that touched one file or folder.
 //!
 //! Moving on to the next edit or file marks the current one reviewed, so a
 //! long run of changes (say, from a coding agent) can be read through before
@@ -20,12 +22,19 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::git::{Commit, Repo};
 use crate::timeline::{self, Source, Step, Timeline};
 
 const KEY_CONTEXT: &str = "Changes";
 const LIST_WIDTH: Pixels = px(240.);
 const ROW_HEIGHT: Pixels = px(26.);
 const EDIT_ROW_HEIGHT: Pixels = px(40.);
+/// How many commits the history lists.
+const HISTORY_LIMIT: usize = 300;
+/// How many of one commit's files are shown.
+const COMMIT_FILE_LIMIT: usize = 300;
+/// How many commits' diffs are kept after they've been looked at.
+const COMMIT_CACHE_SIZE: usize = 40;
 
 gpui_kit::actions!(
     changes,
@@ -56,6 +65,14 @@ pub enum Mode {
     Timeline,
     ByFile,
     AllFiles,
+    History,
+}
+
+/// The files one commit changed, ready for the diff.
+struct CommitFiles {
+    files: Vec<ChangedFile>,
+    /// It changed more files than are shown.
+    truncated: bool,
 }
 
 /// One changed file (or one edit's change to a file), parsed for the diff.
@@ -143,6 +160,18 @@ pub struct ChangesView {
     soft_wrap: bool,
     list_scroll: ScrollHandle,
     _timeline_observer: Option<Subscription>,
+    /// The repository, for reading its history.
+    repo: Option<Repo>,
+    /// Commits newest first, and the one showing.
+    commits: Vec<Commit>,
+    commit_cursor: Cursor,
+    /// Only commits that touch this file or folder (relative), when set.
+    history_path: Option<String>,
+    history_loaded: bool,
+    /// Commits' changed files, by `commit_key`.
+    commit_cache: HashMap<String, CommitFiles>,
+    _history_task: Option<Task<()>>,
+    _commit_task: Option<Task<()>>,
 }
 
 impl EventEmitter<ChangesEvent> for ChangesView {}
@@ -176,6 +205,14 @@ impl ChangesView {
             soft_wrap,
             list_scroll: ScrollHandle::new(),
             _timeline_observer: None,
+            repo: None,
+            commits: Vec::new(),
+            commit_cursor: Cursor::default(),
+            history_path: None,
+            history_loaded: false,
+            commit_cache: HashMap::new(),
+            _history_task: None,
+            _commit_task: None,
         }
     }
 
@@ -187,8 +224,142 @@ impl ChangesView {
         if self.mode != mode {
             self.mode = mode;
             self.cursor_mut().finished = false;
+            if mode == Mode::History && !self.history_loaded {
+                self.load_history(cx);
+            }
             self.show(true, cx);
         }
+    }
+
+    // ---- History -----------------------------------------------------------
+
+    /// A different repository, or none: its history is read when shown.
+    pub fn set_repo(&mut self, repo: Option<Repo>, cx: &mut Context<Self>) {
+        if self.repo == repo {
+            return;
+        }
+        self.repo = repo;
+        self.commits.clear();
+        self.commit_cache.clear();
+        self.commit_cursor = Cursor::default();
+        self.history_loaded = false;
+        self._history_task = None;
+        self._commit_task = None;
+        if self.mode == Mode::History {
+            self.load_history(cx);
+        }
+        self.show(false, cx);
+    }
+
+    /// Show the history: of everything, or of one file or folder (relative).
+    pub fn show_history(&mut self, path: Option<String>, cx: &mut Context<Self>) {
+        self.mode = Mode::History;
+        if self.history_path != path || !self.history_loaded {
+            self.history_path = path;
+            self.commits.clear();
+            self.commit_cursor = Cursor::default();
+            self.history_loaded = false;
+            self.load_history(cx);
+        }
+        self.show(true, cx);
+    }
+
+    /// Something was committed or checked out: list the commits again, if
+    /// they've been read.
+    pub fn refresh_history(&mut self, cx: &mut Context<Self>) {
+        if self.history_loaded {
+            self.load_history(cx);
+        }
+    }
+
+    /// Read the commits in the background, keeping the one showing if it's
+    /// still there.
+    fn load_history(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else {
+            self.history_loaded = true;
+            cx.notify();
+            return;
+        };
+        let path = self.history_path.clone();
+        self._history_task = Some(cx.spawn(async move |this, cx| {
+            let commits = cx
+                .background_spawn(async move { repo.log(path.as_deref(), HISTORY_LIMIT) })
+                .await;
+            this.update(cx, |this, cx| {
+                let previous = this
+                    .commits
+                    .get(this.commit_cursor.current)
+                    .map(|commit| commit.id.clone());
+                this.commits = commits;
+                this.history_loaded = true;
+                let current = previous
+                    .and_then(|id| this.commits.iter().position(|commit| commit.id == id))
+                    .unwrap_or(0);
+                this.commit_cursor = Cursor {
+                    current,
+                    finished: false,
+                };
+                this.load_commit(cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Identifies the files shown for a commit: they depend on the path too.
+    fn commit_key(&self, ix: usize) -> Option<String> {
+        let commit = self.commits.get(ix)?;
+        Some(format!("{}:{}", commit.id, self.history_path.as_deref().unwrap_or("")))
+    }
+
+    fn current_commit_files(&self) -> Option<&CommitFiles> {
+        self.commit_cache.get(&self.commit_key(self.commit_cursor.current)?)
+    }
+
+    /// Show the current commit's changes, reading them first if needed.
+    fn load_commit(&mut self, cx: &mut Context<Self>) {
+        let ix = self.commit_cursor.current;
+        let Some(key) = self.commit_key(ix) else {
+            self.show(true, cx);
+            return;
+        };
+        if self.commit_cache.contains_key(&key) {
+            self._commit_task = None;
+            self.show(true, cx);
+            return;
+        }
+        let (Some(repo), Some(commit)) = (self.repo.clone(), self.commits.get(ix)) else {
+            return;
+        };
+        let id = commit.id.clone();
+        let path = self.history_path.clone();
+        // Until it arrives, show nothing rather than the last commit.
+        self.show(true, cx);
+        self._commit_task = Some(cx.spawn(async move |this, cx| {
+            let (patches, truncated) = cx
+                .background_spawn(async move { repo.commit_patches(&id, path.as_deref(), COMMIT_FILE_LIMIT) })
+                .await;
+            let files = patches
+                .iter()
+                .filter_map(|patch| ChangedFile::parse(patch).ok())
+                .collect();
+            this.update(cx, |this, cx| {
+                if this.commit_cache.len() >= COMMIT_CACHE_SIZE {
+                    this.commit_cache.clear();
+                }
+                this.commit_cache.insert(key, CommitFiles { files, truncated });
+                if this.mode == Mode::History {
+                    this.show(true, cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Read the commits again, and their changes as they're shown.
+    fn reload_history(&mut self, cx: &mut Context<Self>) {
+        self.commit_cache.clear();
+        self.load_history(cx);
+        cx.notify();
     }
 
     /// Show the timeline from its first edit not yet reviewed.
@@ -332,6 +503,8 @@ impl ChangesView {
                     step: None,
                 })
                 .collect(),
+            // Commits aren't reviewed; they have their own list.
+            Mode::History => Vec::new(),
         }
     }
 
@@ -339,6 +512,7 @@ impl ChangesView {
         match self.mode {
             Mode::Timeline => self.edits.len(),
             Mode::ByFile | Mode::AllFiles => self.files.len(),
+            Mode::History => self.commits.len(),
         }
     }
 
@@ -346,6 +520,7 @@ impl ChangesView {
         match self.mode {
             Mode::Timeline => self.edit_cursor,
             Mode::ByFile | Mode::AllFiles => self.file_cursor,
+            Mode::History => self.commit_cursor,
         }
     }
 
@@ -353,6 +528,7 @@ impl ChangesView {
         match self.mode {
             Mode::Timeline => &mut self.edit_cursor,
             Mode::ByFile | Mode::AllFiles => &mut self.file_cursor,
+            Mode::History => &mut self.commit_cursor,
         }
     }
 
@@ -367,6 +543,10 @@ impl ChangesView {
             Mode::AllFiles => self.files.iter().collect(),
             Mode::ByFile => self.files.get(current).into_iter().collect(),
             Mode::Timeline => self.edits.get(current).map(|edit| &edit.file).into_iter().collect(),
+            Mode::History => self
+                .current_commit_files()
+                .map(|commit| commit.files.iter().collect())
+                .unwrap_or_default(),
         };
         let key = (
             self.mode,
@@ -375,6 +555,8 @@ impl ChangesView {
         let path = match self.mode {
             Mode::Timeline => self.edits.get(current).map(|edit| edit.file.path().to_string()),
             Mode::ByFile | Mode::AllFiles => self.files.get(current).map(|file| file.path().to_string()),
+            // A commit's diff starts at its first file.
+            Mode::History => shown.first().map(|file| file.path().to_string()),
         };
         let replaced = self.shown.as_ref() != Some(&key);
         if replaced {
@@ -404,12 +586,17 @@ impl ChangesView {
                 current: ix,
                 finished: false,
             };
-            self.show(true, cx);
+            if self.mode == Mode::History {
+                self.load_commit(cx);
+            } else {
+                self.show(true, cx);
+            }
         }
     }
 
     fn set_reviewed(&mut self, ix: usize, reviewed: bool, cx: &mut Context<Self>) {
         match self.mode {
+            Mode::History => return,
             Mode::Timeline => {
                 let Some(edit) = self.edits.get_mut(ix) else {
                     return;
@@ -446,7 +633,7 @@ impl ChangesView {
         self.set_reviewed(cursor.current, true, cx);
         if cursor.current + 1 < count {
             self.go_to(cursor.current + 1, cx);
-        } else if self.mode != Mode::AllFiles {
+        } else if !matches!(self.mode, Mode::AllFiles | Mode::History) {
             self.cursor_mut().finished = true;
             cx.notify();
         }
@@ -488,6 +675,7 @@ impl ChangesView {
                 }
             }
             Mode::ByFile | Mode::AllFiles => self.reviewed.clear(),
+            Mode::History => {}
         }
         self.go_to(0, cx);
     }
@@ -542,7 +730,38 @@ impl ChangesView {
                     (a + file.diff.additions(), d + file.diff.deletions())
                 })),
             ),
+            Mode::History => (
+                match self.commits.len() {
+                    0 => String::new(),
+                    1 => "1 commit".into(),
+                    n if n >= HISTORY_LIMIT => format!("latest {n} commits"),
+                    n => format!("{n} commits"),
+                },
+                None,
+            ),
         };
+        let title = if self.mode == Mode::History { "HISTORY" } else { "CHANGES" };
+        // The file or folder the history is narrowed to, with a way back to all of it.
+        let history_path = self
+            .history_path
+            .clone()
+            .filter(|_| self.mode == Mode::History)
+            .map(|path| {
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_1()
+                    .min_w_0()
+                    .child(div().min_w_0().truncate().child(format!("of {path}")))
+                    .child(
+                        Button::new("clear-history-path")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip("Show the history of everything")
+                            .on_click(cx.listener(|this, _, _, cx| this.show_history(None, cx))),
+                    )
+            });
         let toggle = |id: &'static str, label: &'static str, selected: bool| {
             Button::new(id).ghost().xsmall().label(label).selected(selected)
         };
@@ -560,7 +779,7 @@ impl ChangesView {
             .border_color(border)
             .text_xs()
             .text_color(muted)
-            .child(div().font_weight(FontWeight::SEMIBOLD).child("CHANGES"))
+            .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
             .when_some(self.branch.clone(), |row, branch| {
                 row.child(
                     div()
@@ -571,7 +790,8 @@ impl ChangesView {
                         .child(branch),
                 )
             })
-            .child(summary)
+            .child(div().flex_none().child(summary))
+            .children(history_path)
             .when_some(totals.filter(|_| has_items), |row, (additions, deletions)| {
                 row.child(div().text_color(success).child(format!("+{additions}")))
                     .child(div().text_color(danger).child(format!("−{deletions}")))
@@ -591,6 +811,11 @@ impl ChangesView {
                 toggle("changes-all", "All files", self.mode == Mode::AllFiles)
                     .tooltip("Every changed file in one list")
                     .on_click(cx.listener(|this, _, _, cx| this.set_mode(Mode::AllFiles, cx))),
+            )
+            .child(
+                toggle("changes-history", "History", self.mode == Mode::History)
+                    .tooltip("The commits already made, and what each one changed")
+                    .on_click(cx.listener(|this, _, _, cx| this.set_mode(Mode::History, cx))),
             )
             .child(divider())
             .child(
@@ -640,7 +865,13 @@ impl ChangesView {
                         .xsmall()
                         .icon(IconName::RefreshCw)
                         .tooltip("Refresh")
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(ChangesEvent::Refresh))),
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.mode == Mode::History {
+                                this.reload_history(cx);
+                            } else {
+                                cx.emit(ChangesEvent::Refresh);
+                            }
+                        })),
                 )
             })
     }
@@ -811,9 +1042,10 @@ impl ChangesView {
         let item = &items[cursor.current];
         let is_reviewed = item.reviewed;
         let is_last = cursor.current + 1 == items.len();
+        // History has its own bar, `render_commit_bar`.
         let (noun, next_label) = match self.mode {
             Mode::Timeline => ("Edit", "Next edit"),
-            Mode::ByFile | Mode::AllFiles => ("File", "Next file"),
+            Mode::ByFile | Mode::AllFiles | Mode::History => ("File", "Next file"),
         };
         let mut position = format!("{noun} {} of {}", cursor.current + 1, items.len());
         if let Some(step) = item.step {
@@ -952,6 +1184,177 @@ impl ChangesView {
             )
     }
 
+    /// The commits, newest first: subject, then id, author and when.
+    fn render_history_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (muted, border, hover, active) = (
+            theme.muted_foreground,
+            theme.border,
+            theme.list_hover,
+            theme.list_active,
+        );
+        let mono = theme.mono_font_family.clone();
+        let current = self.commit_cursor.current;
+        let rows: Vec<AnyElement> = self
+            .commits
+            .iter()
+            .enumerate()
+            .map(|(ix, commit)| {
+                div()
+                    .id(("commit-row", ix))
+                    .flex_none()
+                    .h(EDIT_ROW_HEIGHT)
+                    .v_flex()
+                    .justify_center()
+                    .px_3()
+                    .hover(|style| style.bg(hover))
+                    .when(ix == current, |row| row.bg(active))
+                    .child(div().text_sm().truncate().child(commit.subject.clone()))
+                    .child(
+                        div()
+                            .h_flex()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(div().flex_none().font_family(mono.clone()).child(commit.short_id.clone()))
+                            .child(div().min_w_0().truncate().child(commit.author.clone()))
+                            .child(div().flex_none().child(timeline::ago(commit.time.max(0) as u64 * 1000))),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.go_to(ix, cx);
+                        this.focus_handle(cx).focus(window, cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+
+        div()
+            .v_flex()
+            .w(LIST_WIDTH)
+            .flex_none()
+            .h_full()
+            .border_r_1()
+            .border_color(border)
+            .child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .text_color(muted)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("COMMITS"),
+            )
+            .child(
+                div()
+                    .id("commit-rows")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.list_scroll)
+                    .children(rows),
+            )
+    }
+
+    /// The commit showing, and the buttons to move to newer and older ones.
+    fn render_commit_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (muted, border) = (theme.muted_foreground, theme.border);
+        let current = self.commit_cursor.current;
+        let commit = &self.commits[current];
+        let details = format!(
+            "{} · {} · {} · commit {} of {}",
+            commit.short_id,
+            commit.author,
+            timeline::ago(commit.time.max(0) as u64 * 1000),
+            current + 1,
+            self.commits.len(),
+        );
+
+        div()
+            .h_flex()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1p5()
+            .border_b_1()
+            .border_color(border)
+            .child(
+                div()
+                    .v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .truncate()
+                            .child(commit.subject.clone()),
+                    )
+                    .child(div().text_xs().text_color(muted).truncate().child(details)),
+            )
+            .child(
+                Button::new("newer-commit")
+                    .small()
+                    .icon(IconName::ChevronLeft)
+                    .label("Newer")
+                    .tooltip("Newer commit (P)")
+                    .disabled(current == 0)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.previous_file(&PreviousFile, window, cx)
+                    })),
+            )
+            .child(
+                Button::new("older-commit")
+                    .small()
+                    .icon(IconName::ChevronRight)
+                    .label("Older")
+                    .tooltip("Older commit (N)")
+                    .disabled(current + 1 >= self.commits.len())
+                    .on_click(cx.listener(|this, _, window, cx| this.next_file(&NextFile, window, cx))),
+            )
+    }
+
+    /// The selected commit's diff, or why there's none to show yet.
+    fn render_commit_body(&self, root: PathBuf, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let note = |text: String| {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px_8()
+                .text_sm()
+                .text_color(muted)
+                .child(div().max_w(px(460.)).text_center().child(text))
+                .into_any_element()
+        };
+        match self.current_commit_files() {
+            None => note("Loading the commit…".into()),
+            Some(commit) if commit.files.is_empty() => note(match &self.history_path {
+                Some(path) => format!("This commit didn't change {path}."),
+                None => "This commit didn't change any files compared with its first parent.".into(),
+            }),
+            Some(commit) => div()
+                .v_flex()
+                .flex_1()
+                .min_h_0()
+                .when(commit.truncated, |column| {
+                    column.child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(format!("Showing the first {COMMIT_FILE_LIMIT} files this commit changed.")),
+                    )
+                })
+                .child(self.render_diff(root, cx))
+                .into_any_element(),
+        }
+    }
+
     fn render_diff(&self, root: PathBuf, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.weak_entity();
         let open_button = {
@@ -1026,6 +1429,16 @@ impl ChangesView {
                 _ if self.files.is_empty() => Some("No changes since the last commit.".into()),
                 _ => None,
             },
+            Mode::History => match &self.repo {
+                None if self.loaded => Some("The folder in the explorer isn't in a Git repository.".into()),
+                None => Some("Loading the history…".into()),
+                Some(_) if !self.history_loaded => Some("Loading the history…".into()),
+                Some(_) if self.commits.is_empty() => Some(match &self.history_path {
+                    Some(path) => format!("No commits have changed {path}."),
+                    None => "Nothing has been committed yet.".into(),
+                }),
+                Some(_) => None,
+            },
         }
     }
 }
@@ -1046,7 +1459,8 @@ impl Render for ChangesView {
         let muted = cx.theme().muted_foreground;
         let message = self.empty_message(cx);
         let has_items = message.is_none() && self.item_count() > 0;
-        let finished = self.cursor().finished && self.mode != Mode::AllFiles;
+        let history = self.mode == Mode::History;
+        let finished = self.cursor().finished && !matches!(self.mode, Mode::AllFiles | Mode::History);
 
         let body = match (message, self.root(cx)) {
             (Some(text), _) => div()
@@ -1060,6 +1474,14 @@ impl Render for ChangesView {
                 .child(div().max_w(px(460.)).text_center().child(text))
                 .into_any_element(),
             (None, _) if finished => self.render_summary(cx).into_any_element(),
+            (None, Some(root)) if history => div()
+                .v_flex()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .child(self.render_commit_bar(cx))
+                .child(self.render_commit_body(root, cx))
+                .into_any_element(),
             (None, Some(root)) => div()
                 .v_flex()
                 .flex_1()
@@ -1089,7 +1511,8 @@ impl Render for ChangesView {
                     .items_stretch()
                     .flex_1()
                     .min_h_0()
-                    .when(has_items, |row| row.child(self.render_list(cx)))
+                    .when(has_items && history, |row| row.child(self.render_history_list(cx)))
+                    .when(has_items && !history, |row| row.child(self.render_list(cx)))
                     .child(body),
             )
     }

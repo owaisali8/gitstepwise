@@ -232,7 +232,9 @@ pub fn ago(time_ms: u64) -> String {
         10..=59 => format!("{seconds} s ago"),
         60..=3599 => format!("{} min ago", seconds / 60),
         3600..=86_399 => format!("{} h ago", seconds / 3600),
-        _ => format!("{} d ago", seconds / 86_400),
+        86_400..=2_591_999 => format!("{} d ago", seconds / 86_400),
+        2_592_000..=31_535_999 => format!("{} mo ago", seconds / 2_592_000),
+        _ => format!("{} y ago", seconds / 31_536_000),
     }
 }
 

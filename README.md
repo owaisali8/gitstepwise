@@ -42,10 +42,22 @@ was made. Step through until you've seen everything, then commit.
 - Gutter marks for added (green), modified (blue) and deleted (red) lines, also
   shown on the scrollbar. They update as you type.
 - The branch and number of changed files in the status bar.
+- **Commit history** (View → Commit History, or History in the Changes tab): the
+  commits on the branch, newest first, and what each one changed. Right-click a
+  file or folder and choose **View History** for only the commits that touched it.
+
+**The explorer**
+
+- Icons for each kind of file, in their own colors.
+- Right-click a file or folder for New File and New Folder, Rename, Duplicate,
+  Cut, Copy and Paste, Move to Recycle Bin (or Trash) and Delete, Reveal in File
+  Explorer, Open in Default App, Open in Terminal, Copy Path and Copy Relative
+  Path, Add to `.gitignore` or `.git/info/exclude`, View History, and Open or
+  Copy File Permalink (for GitHub and GitLab remotes).
 
 **The editor itself**
 
-- Tabs, a file explorer (with New File and New Folder), and an integrated terminal.
+- Tabs, the file explorer, and an integrated terminal.
 - Syntax highlighting for Rust, TOML, Markdown, Python, JavaScript, TypeScript,
   HTML, CSS, JSON, YAML and shell scripts.
 - Word wrap, line numbers, zoom, and light and dark themes.
@@ -121,7 +133,21 @@ In the **Changes** tab:
 | Next / previous change in the diff | ] / [ |
 | Mark reviewed, or not | R |
 
-In the **explorer**, the arrow keys move and expand or collapse folders, and Enter opens.
+In the **explorer**, the arrow keys move and expand or collapse folders, and Enter
+opens. These act on the selected file or folder:
+
+| Action | Shortcut |
+| --- | --- |
+| New file / new folder here | Ctrl+N / Alt+N |
+| Rename | F2 |
+| Cut / copy / paste | Ctrl+X / Ctrl+C / Ctrl+V |
+| Duplicate | Ctrl+D |
+| Move to Recycle Bin / delete | Delete / Ctrl+Delete |
+| Copy path / relative path | Alt+Shift+C / Ctrl+Alt+Shift+C |
+| Reveal in File Explorer | Ctrl+Alt+R |
+| Open in default app | Ctrl+Shift+Enter |
+
+In the **History** view, N and P go to older and newer commits.
 
 ## How the timeline is stored
 
