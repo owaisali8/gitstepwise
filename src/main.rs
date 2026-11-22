@@ -11,14 +11,20 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod changes;
+mod credentials;
 mod explorer;
 mod file_icons;
 mod git;
 mod markdown;
+mod notes;
+mod projects;
 mod terminal;
+mod terminal_panel;
 mod timeline;
+mod vault;
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -33,15 +39,19 @@ use gpui_kit::component::input::{
 use gpui_kit::component::menu::AppMenuBar;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::text::{TextView, TextViewState};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use changes::{ChangedFile, ChangesEvent, ChangesView, Mode, Select};
+use credentials::{CredentialsEvent, CredentialsPanel};
 use timeline::Timeline;
 use explorer::{Explorer, ExplorerEvent};
 use markdown::{EmbeddedImages, Links, Target};
-use terminal::{TerminalEvent, TerminalView};
+use notes::{NotesEvent, NotesPanel};
+use projects::{ProjectPicker, ProjectPickerEvent, Projects};
+use terminal_panel::{SplitDown, SplitRight, TerminalPanel, TerminalPanelEvent};
 
 gpui_kit::actions!(
     text_editor,
@@ -49,7 +59,14 @@ gpui_kit::actions!(
         NewFile,
         OpenFile,
         OpenFolder,
+        /// Switch to another project: the picker of recent folders.
+        OpenRecent,
         ToggleSidebar,
+        /// Show or hide the project's notes and to-do list.
+        ToggleNotes,
+        /// Show or hide the credentials: passwords, API keys and logins,
+        /// the same in every project.
+        ToggleCredentials,
         ToggleChanges,
         ReviewChanges,
         ShowTimeline,
@@ -85,6 +102,7 @@ const KEY_CONTEXT: &str = "TextEditor";
 const PLAIN_TEXT: &str = "text";
 const MIN_TERMINAL_HEIGHT: Pixels = px(80.);
 const MIN_SIDEBAR_WIDTH: Pixels = px(140.);
+const MIN_NOTES_WIDTH: Pixels = px(200.);
 /// How long typing pauses before the gutter's change markers update.
 const MARKER_DELAY: Duration = Duration::from_millis(150);
 /// How often to check the repository for commits, checkouts and staging.
@@ -115,8 +133,14 @@ gpui_kit::assets::icon_assets!(
         FileText,
         FolderPlus,
         GitBranch,
+        KeyRound,
+        ListTodo,
+        Lock,
         Package,
+        Pencil,
+        Rows2,
         Scale,
+        Trash,
     ]
 );
 
@@ -196,6 +220,8 @@ fn same_file(a: &Path, b: &Path) -> bool {
 #[derive(Clone, Copy, PartialEq)]
 struct MenuChecks {
     sidebar: bool,
+    notes: bool,
+    credentials: bool,
     changes: bool,
     terminal: bool,
     soft_wrap: bool,
@@ -215,6 +241,7 @@ fn app_menus(checks: MenuChecks) -> Vec<Menu> {
             MenuItem::action("New File", NewFile),
             MenuItem::action("Open File…", OpenFile),
             MenuItem::action("Open Folder…", OpenFolder),
+            MenuItem::action("Open Recent…", OpenRecent),
             MenuItem::separator(),
             MenuItem::action("Save", SaveFile),
             MenuItem::action("Save As…", SaveFileAs),
@@ -238,11 +265,15 @@ fn app_menus(checks: MenuChecks) -> Vec<Menu> {
         ]),
         Menu::new("View").items([
             MenuItem::action("Explorer", ToggleSidebar).checked(checks.sidebar),
+            MenuItem::action("Notes and To-do", ToggleNotes).checked(checks.notes),
+            MenuItem::action("Credentials", ToggleCredentials).checked(checks.credentials),
             MenuItem::action("Changes", ToggleChanges).checked(checks.changes),
             MenuItem::action("Review Changes Step by Step", ReviewChanges),
             MenuItem::action("Edit Timeline", ShowTimeline),
             MenuItem::action("Commit History", ShowHistory),
             MenuItem::action("Terminal", ToggleTerminal).checked(checks.terminal),
+            MenuItem::action("Split Terminal Right", SplitRight),
+            MenuItem::action("Split Terminal Down", SplitDown),
             MenuItem::separator(),
             MenuItem::action("Word Wrap", ToggleSoftWrap).checked(checks.soft_wrap),
             MenuItem::action("Line Numbers", ToggleLineNumbers).checked(checks.line_numbers),
@@ -262,6 +293,14 @@ fn app_menus(checks: MenuChecks) -> Vec<Menu> {
             MenuItem::action("Dark Theme", UseDarkTheme).checked(checks.dark),
         ]),
     ]
+}
+
+/// A project's terminals, kept running while another project shows.
+struct ParkedTerminal {
+    folder: PathBuf,
+    panel: Entity<TerminalPanel>,
+    visible: bool,
+    _subscription: Option<Subscription>,
 }
 
 /// A step that runs once unsaved changes have been saved or discarded.
@@ -402,6 +441,7 @@ impl FpsMeter {
 enum Resize {
     Terminal { start_y: Pixels, start_height: Pixels },
     Sidebar { start_x: Pixels, start_width: Pixels },
+    Notes { start_x: Pixels, start_width: Pixels },
 }
 
 struct Workspace {
@@ -419,7 +459,16 @@ struct Workspace {
     explorer: Entity<Explorer>,
     sidebar_visible: bool,
     sidebar_width: Pixels,
-    terminal: Option<Entity<TerminalView>>,
+    /// The project's notes and to-dos, in a panel at the right.
+    notes: Entity<NotesPanel>,
+    notes_visible: bool,
+    notes_width: Pixels,
+    /// The credentials vault, over the window while it shows. It belongs to
+    /// no project, and stays unlocked across project switches.
+    credentials: Entity<CredentialsPanel>,
+    credentials_visible: bool,
+    /// The terminals, once one has been opened.
+    terminal: Option<Entity<TerminalPanel>>,
     terminal_visible: bool,
     terminal_height: Pixels,
     resizing: Option<Resize>,
@@ -431,6 +480,16 @@ struct Workspace {
     repo: Option<git::Repo>,
     /// Every edit to the repository's files, in order, since the last commit.
     timeline: Option<Entity<Timeline>>,
+    /// The timeline of every repository shown so far, by its root. They keep
+    /// recording while another project shows.
+    timelines: HashMap<PathBuf, Entity<Timeline>>,
+    /// The terminals of the other projects opened.
+    parked_terminals: Vec<ParkedTerminal>,
+    /// The list of projects to switch to, while it shows.
+    project_picker: Option<(Entity<ProjectPicker>, Subscription)>,
+    /// The project folder, its open files and the one showing, as last
+    /// remembered in the list of projects.
+    last_session: Option<(PathBuf, Vec<PathBuf>, Option<PathBuf>)>,
     /// Last seen modification times in `.git`, to notice commits and staging.
     repo_stamp: Option<Vec<Option<SystemTime>>>,
     branch: Option<SharedString>,
@@ -450,12 +509,27 @@ struct Workspace {
 impl Workspace {
     fn new(paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         // The explorer shows the first folder given, else the first file's
-        // folder, else the current directory.
+        // folder. Given nothing, it reopens the last project, else shows the
+        // current directory. A folder given or reopened is a project: it goes
+        // first in the list of projects, and with no files given, the files
+        // last open in it open again.
+        let nothing_given = paths.is_empty();
         let (folders, files): (Vec<PathBuf>, Vec<PathBuf>) =
             paths.into_iter().partition(|path| path.is_dir());
-        let root = folders
-            .first()
-            .cloned()
+        let last_project = || {
+            cx.global::<Projects>()
+                .list()
+                .iter()
+                .map(|project| project.path.clone())
+                .find(|path| path.is_dir())
+        };
+        let project = match folders.first() {
+            Some(folder) => Some(std::path::absolute(folder).unwrap_or_else(|_| folder.clone())),
+            None if nothing_given => last_project(),
+            None => None,
+        };
+        let root = project
+            .clone()
             .or_else(|| {
                 files
                     .first()
@@ -465,9 +539,19 @@ impl Workspace {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
 
-        let explorer = cx.new(|cx| Explorer::new(root, cx));
+        let explorer = cx.new(|cx| Explorer::new(root.clone(), cx));
+        let notes = cx.new(|cx| {
+            let mut notes = NotesPanel::new(window, cx);
+            notes.set_project(root, window, cx);
+            notes
+        });
+        let credentials = cx.new(|cx| CredentialsPanel::new(window, cx));
         let mut subscriptions = vec![
             cx.subscribe_in(&explorer, window, Self::on_explorer_event),
+            cx.subscribe_in(&notes, window, Self::on_notes_event),
+            cx.subscribe_in(&credentials, window, Self::on_credentials_event),
+            // The status bar counts the to-dos left.
+            cx.observe(&notes, |_, _, cx| cx.notify()),
             // Pick up files created elsewhere when the user comes back.
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
@@ -508,6 +592,11 @@ impl Workspace {
             explorer,
             sidebar_visible: true,
             sidebar_width: px(240.),
+            notes,
+            notes_visible: false,
+            notes_width: px(300.),
+            credentials,
+            credentials_visible: false,
             terminal: None,
             terminal_visible: false,
             terminal_height: px(260.),
@@ -517,6 +606,10 @@ impl Workspace {
             menu_checks: None,
             repo: None,
             timeline: None,
+            timelines: HashMap::new(),
+            parked_terminals: Vec::new(),
+            project_picker: None,
+            last_session: None,
             repo_stamp: None,
             branch: None,
             changed_files: 0,
@@ -531,6 +624,15 @@ impl Workspace {
         };
         this.sync_menus(cx);
 
+        if let Some(project) = &project {
+            cx.update_global::<Projects, _>(|projects, _| {
+                projects.opened(project.clone(), projects::now_ms());
+                projects.save();
+            });
+            if files.is_empty() {
+                this.restore_session(project, window, cx);
+            }
+        }
         for path in files {
             this.open_path(path, window, cx);
         }
@@ -678,9 +780,11 @@ impl Workspace {
             .update(cx, |explorer, cx| explorer.set_active_file(path.as_deref(), cx));
     }
 
-    fn show_folder(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+    fn show_folder(&mut self, folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.explorer
-            .update(cx, |explorer, cx| explorer.set_root(folder, cx));
+            .update(cx, |explorer, cx| explorer.set_root(folder.clone(), cx));
+        self.notes
+            .update(cx, |notes, cx| notes.set_project(folder, window, cx));
         self.sidebar_visible = true;
         self.refresh_repo(cx);
         cx.notify();
@@ -700,9 +804,162 @@ impl Workspace {
             let Some(folder) = paths.into_iter().next() else {
                 return;
             };
-            this.update(cx, |this, cx| this.show_folder(folder, cx)).ok();
+            this.update_in(cx, |this, window, cx| this.open_project(folder, window, cx))
+                .ok();
         })
         .detach();
+    }
+
+    // ---- Projects ----------------------------------------------------------
+
+    /// Open `folder` as the project: ask about unsaved changes, then swap
+    /// the tabs for the ones last open in it.
+    fn open_project(&mut self, folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let folder = std::path::absolute(&folder).unwrap_or(folder);
+        if !folder.is_dir() {
+            self.set_status(format!("{} isn't there any more.", folder.display()), true, cx);
+            return;
+        }
+        if projects::same_folder(&folder, &self.default_folder(cx)) {
+            // Already showing: it only becomes a project, if it wasn't one.
+            self.remember_opened(folder, cx);
+            self.sidebar_visible = true;
+            cx.notify();
+            return;
+        }
+        self.confirm_close_all(
+            window,
+            cx,
+            Box::new(move |this, window, cx| this.switch_project(folder, window, cx)),
+        );
+    }
+
+    /// Put `folder` first in the list of projects.
+    fn remember_opened(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+        cx.update_global::<Projects, _>(|projects, _| {
+            projects.opened(folder, projects::now_ms());
+            projects.save();
+        });
+    }
+
+    /// Show `folder` in place of the project showing. Its unsaved changes
+    /// have been saved or discarded by now. Its terminals keep running, to
+    /// come back with it.
+    fn switch_project(&mut self, folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let old = self.default_folder(cx);
+        if let Some(panel) = self.terminal.take() {
+            self.parked_terminals.push(ParkedTerminal {
+                folder: old,
+                panel,
+                visible: self.terminal_visible,
+                _subscription: self._terminal_subscription.take(),
+            });
+        }
+        self.terminal_visible = false;
+        let parked = self
+            .parked_terminals
+            .iter()
+            .position(|parked| projects::same_folder(&parked.folder, &folder));
+        if let Some(ix) = parked {
+            let parked = self.parked_terminals.remove(ix);
+            self.terminal = Some(parked.panel);
+            self._terminal_subscription = parked._subscription;
+            self.terminal_visible = parked.visible;
+        }
+
+        self.documents.clear();
+        self.active = 0;
+        self.changes_open = false;
+        self.changes_active = false;
+        self.explorer
+            .update(cx, |explorer, cx| explorer.set_root(folder.clone(), cx));
+        self.notes
+            .update(cx, |notes, cx| notes.set_project(folder.clone(), window, cx));
+        self.sidebar_visible = true;
+        self.remember_opened(folder.clone(), cx);
+        self.restore_session(&folder, window, cx);
+        self.refresh_repo(cx);
+        self.show_active(window, cx);
+        self.set_status(format!("Opened {}", folder.display()), false, cx);
+    }
+
+    /// Open the files that were open in the project at `folder` the last
+    /// time, and show the one that was showing.
+    fn restore_session(&mut self, folder: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = cx.global::<Projects>().get(folder).cloned() else {
+            return;
+        };
+        for file in project.files.iter().filter(|file| file.is_file()) {
+            self.open_path(file.clone(), window, cx);
+        }
+        let active = project.active.and_then(|active| {
+            self.documents
+                .iter()
+                .position(|doc| doc.path.as_deref() == Some(active.as_path()))
+        });
+        if let Some(ix) = active {
+            self.activate(ix, window, cx);
+        }
+    }
+
+    /// Keep the list of projects up to date with the files open in this
+    /// one. Runs on every render, and writes only when they change.
+    fn sync_project_session(&mut self, cx: &mut Context<Self>) {
+        let folder = self.default_folder(cx);
+        let files: Vec<PathBuf> = self.documents.iter().filter_map(|doc| doc.path.clone()).collect();
+        let active = self.active_document().and_then(|doc| doc.path.clone());
+        if let Some((last_folder, last_files, last_active)) = &self.last_session
+            && *last_folder == folder
+            && *last_files == files
+            && *last_active == active
+        {
+            return;
+        }
+        let changed = cx.update_global::<Projects, _>(|projects, _| {
+            projects.set_session(&folder, &files, active.as_deref())
+        });
+        self.last_session = Some((folder, files, active));
+        if changed {
+            // Not while drawing.
+            cx.defer(|cx| cx.global::<Projects>().save());
+        }
+    }
+
+    /// Show the list of projects to switch to, or close it.
+    fn open_recent(&mut self, _: &OpenRecent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.project_picker.is_some() {
+            self.close_picker(window, cx);
+            return;
+        }
+        self.hide_credentials(window, cx);
+        let current = self.default_folder(cx);
+        let picker = cx.new(|cx| ProjectPicker::new(&current, window, cx));
+        let subscription = cx.subscribe_in(&picker, window, Self::on_picker_event);
+        picker.read(cx).focus_handle(cx).focus(window, cx);
+        self.project_picker = Some((picker, subscription));
+        cx.notify();
+    }
+
+    fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.project_picker.take().is_some() {
+            self.focus_active(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn on_picker_event(
+        &mut self,
+        _: &Entity<ProjectPicker>,
+        event: &ProjectPickerEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_picker(window, cx);
+        match event {
+            ProjectPickerEvent::Open(folder) => self.open_project(folder.clone(), window, cx),
+            ProjectPickerEvent::OpenFolder => self.open_folder(&OpenFolder, window, cx),
+            ProjectPickerEvent::Dismissed => {}
+        }
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, window: &mut Window, cx: &mut Context<Self>) {
@@ -711,6 +968,75 @@ impl Workspace {
             self.focus_active(window, cx);
         }
         cx.notify();
+    }
+
+    /// Show the notes and to-dos, with the cursor in the to-do field, or
+    /// hide them.
+    fn toggle_notes(&mut self, _: &ToggleNotes, window: &mut Window, cx: &mut Context<Self>) {
+        if self.notes_visible {
+            self.hide_notes(window, cx);
+            return;
+        }
+        self.notes_visible = true;
+        self.notes.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn hide_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.notes_visible = false;
+        if self.notes.read(cx).has_focus(window, cx) {
+            self.focus_active(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn on_notes_event(
+        &mut self,
+        _: &Entity<NotesPanel>,
+        event: &NotesEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            NotesEvent::Close => self.hide_notes(window, cx),
+        }
+    }
+
+    /// Show the credentials, with the cursor in the search box (or the
+    /// master password field while they're locked), or hide them.
+    fn toggle_credentials(&mut self, _: &ToggleCredentials, window: &mut Window, cx: &mut Context<Self>) {
+        if self.credentials_visible {
+            self.hide_credentials(window, cx);
+            return;
+        }
+        self.close_picker(window, cx);
+        self.credentials_visible = true;
+        self.credentials.update(cx, |credentials, cx| credentials.shown(window, cx));
+        cx.notify();
+    }
+
+    fn hide_credentials(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.credentials_visible {
+            return;
+        }
+        self.credentials_visible = false;
+        if self.credentials.read(cx).contains_focus(window, cx) {
+            self.focus_active(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn on_credentials_event(
+        &mut self,
+        _: &Entity<CredentialsPanel>,
+        event: &CredentialsEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            CredentialsEvent::Close => self.hide_credentials(window, cx),
+            CredentialsEvent::Notice(message) => self.set_status(message.clone(), false, cx),
+        }
     }
 
     fn focus_explorer(&mut self, _: &FocusExplorer, window: &mut Window, cx: &mut Context<Self>) {
@@ -865,7 +1191,7 @@ impl Workspace {
     /// is shown in the explorer instead.
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if path.is_dir() {
-            self.show_folder(path, cx);
+            self.show_folder(path, window, cx);
             return;
         }
 
@@ -997,6 +1323,8 @@ impl Workspace {
         let doc = self.active_document().filter(|_| !self.changes_active);
         let checks = MenuChecks {
             sidebar: self.sidebar_visible,
+            notes: self.notes_visible,
+            credentials: self.credentials_visible,
             changes: self.changes_open,
             terminal: self.terminal_visible,
             soft_wrap: self.soft_wrap,
@@ -1219,9 +1547,18 @@ impl Workspace {
             this.update(cx, |this, cx| {
                 if this.repo != repo {
                     this.repo_stamp = repo.as_ref().map(git::Repo::stamp);
-                    this.timeline = repo
-                        .clone()
-                        .map(|repo| cx.new(|cx| Timeline::new(repo, cx)));
+                    // A repository shown before still has its timeline, which
+                    // kept recording; it may have missed a commit meanwhile.
+                    this.timeline = repo.clone().map(|repo| {
+                        if let Some(timeline) = this.timelines.get(&repo.root) {
+                            timeline.update(cx, |timeline, cx| timeline.check_head(cx));
+                            return timeline.clone();
+                        }
+                        let root = repo.root.clone();
+                        let timeline = cx.new(|cx| Timeline::new(repo, cx));
+                        this.timelines.insert(root, timeline.clone());
+                        timeline
+                    });
                     this.repo = repo.clone();
                     let timeline = this.timeline.clone();
                     this.changes.update(cx, |view, cx| {
@@ -1539,41 +1876,81 @@ impl Workspace {
 
     fn toggle_terminal(&mut self, _: &ToggleTerminal, window: &mut Window, cx: &mut Context<Self>) {
         if self.terminal_visible {
-            self.terminal_visible = false;
-            self.focus_active(window, cx);
-            cx.notify();
+            self.hide_terminal(window, cx);
             return;
         }
 
-        if self.terminal.is_none() {
-            // Start in the active file's folder, else the explorer's.
-            let working_directory = self
-                .active_document()
-                .and_then(|doc| doc.path.as_deref())
-                .and_then(Path::parent)
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| self.default_folder(cx));
-            if !self.start_terminal(working_directory, window, cx) {
-                return;
+        if self.terminal.is_none() && !self.start_terminal(self.terminal_folder(cx), window, cx) {
+            return;
+        }
+        self.show_terminal(window, cx);
+    }
+
+    fn hide_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.terminal_visible = false;
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// Where a new shell starts: the active file's folder, else the explorer's.
+    fn terminal_folder(&self, cx: &App) -> PathBuf {
+        self.active_document()
+            .and_then(|doc| doc.path.as_deref())
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.default_folder(cx))
+    }
+
+    /// Start a shell in `working_directory`, or say why it couldn't start.
+    fn start_shell(&mut self, working_directory: PathBuf, cx: &mut Context<Self>) -> Option<terminal::Shell> {
+        match terminal::start_shell(Some(working_directory)) {
+            Ok(shell) => Some(shell),
+            Err(err) => {
+                self.set_status(format!("Couldn't start a terminal: {err}"), true, cx);
+                None
+            }
+        }
+    }
+
+    /// Open the terminal panel with a shell in `working_directory`. Returns
+    /// whether it started.
+    fn start_terminal(&mut self, working_directory: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(shell) = self.start_shell(working_directory, cx) else {
+            return false;
+        };
+        let panel = cx.new(|cx| TerminalPanel::new(shell, window, cx));
+        self._terminal_subscription = Some(cx.subscribe_in(&panel, window, Self::on_terminal_event));
+        self.terminal = Some(panel);
+        true
+    }
+
+    /// Start another shell beside the active terminal: to its right on the
+    /// horizontal axis, below it on the vertical. With no terminal yet, open
+    /// the first one.
+    fn split_terminal(&mut self, axis: Axis, window: &mut Window, cx: &mut Context<Self>) {
+        let folder = self.terminal_folder(cx);
+        match self.terminal.clone() {
+            Some(panel) => {
+                let Some(shell) = self.start_shell(folder, cx) else {
+                    return;
+                };
+                panel.update(cx, |panel, cx| panel.split(axis, shell, window, cx));
+            }
+            None => {
+                if !self.start_terminal(folder, window, cx) {
+                    return;
+                }
             }
         }
         self.show_terminal(window, cx);
     }
 
-    /// Start a shell in `working_directory`. Returns whether it started.
-    fn start_terminal(&mut self, working_directory: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        match terminal::start_shell(Some(working_directory)) {
-            Ok(shell) => {
-                let view = cx.new(|cx| TerminalView::new(shell, cx));
-                self._terminal_subscription = Some(cx.subscribe_in(&view, window, Self::on_terminal_event));
-                self.terminal = Some(view);
-                true
-            }
-            Err(err) => {
-                self.set_status(format!("Couldn't start a terminal: {err}"), true, cx);
-                false
-            }
-        }
+    fn split_terminal_right(&mut self, _: &SplitRight, window: &mut Window, cx: &mut Context<Self>) {
+        self.split_terminal(Axis::Horizontal, window, cx);
+    }
+
+    fn split_terminal_down(&mut self, _: &SplitDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.split_terminal(Axis::Vertical, window, cx);
     }
 
     fn show_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1584,11 +1961,11 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Show the terminal in `dir`: a new shell there, or the running one
+    /// Show the terminal in `dir`: a new shell there, or the active one
     /// moved there.
     fn open_terminal_in(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         match &self.terminal {
-            Some(terminal) => terminal.update(cx, |terminal, cx| terminal.change_directory(&dir, cx)),
+            Some(terminal) => terminal.update(cx, |panel, cx| panel.change_directory(&dir, cx)),
             None => {
                 if !self.start_terminal(dir, window, cx) {
                     return;
@@ -1598,7 +1975,7 @@ impl Workspace {
         self.show_terminal(window, cx);
     }
 
-    /// End the shell and remove the panel.
+    /// End every shell and remove the panel.
     fn kill_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.terminal = None;
         self._terminal_subscription = None;
@@ -1609,14 +1986,22 @@ impl Workspace {
 
     fn on_terminal_event(
         &mut self,
-        _: &Entity<TerminalView>,
-        event: &TerminalEvent,
+        panel: &Entity<TerminalPanel>,
+        event: &TerminalPanelEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.terminal.as_ref() != Some(panel) {
+            // Another project's: when its last shell ends, it goes.
+            if matches!(event, TerminalPanelEvent::Closed) {
+                self.parked_terminals.retain(|parked| &parked.panel != panel);
+            }
+            return;
+        }
         match event {
-            TerminalEvent::TitleChanged => cx.notify(),
-            TerminalEvent::Exited => self.kill_terminal(window, cx),
+            TerminalPanelEvent::Split(axis) => self.split_terminal(*axis, window, cx),
+            TerminalPanelEvent::Hide => self.hide_terminal(window, cx),
+            TerminalPanelEvent::Closed => self.kill_terminal(window, cx),
         }
     }
 
@@ -1851,7 +2236,9 @@ impl Workspace {
                     .child(div().flex_none().h_full().child(self.menu_bar.clone()))
                     .child(
                         div()
+                            .h_flex()
                             .flex_none()
+                            .gap_1()
                             // The title bar moves the window when pressed: claim
                             // the press so it clicks the button instead.
                             .on_mouse_down(MouseButton::Left, |_, window, cx| {
@@ -1866,6 +2253,19 @@ impl Workspace {
                                     .tooltip(format!("{sidebar_tooltip} ({})", shortcut("B")))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.toggle_sidebar(&ToggleSidebar, window, cx)
+                                    })),
+                            )
+                            // The project's name; click to switch to another.
+                            .child(
+                                Button::new("switch-project")
+                                    .ghost()
+                                    .xsmall()
+                                    .label(projects::folder_name(&self.default_folder(cx)))
+                                    .dropdown_caret(true)
+                                    .selected(self.project_picker.is_some())
+                                    .tooltip(format!("Switch project ({})", shortcut("Alt+O")))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_recent(&OpenRecent, window, cx)
                                     })),
                             ),
                     ),
@@ -2068,9 +2468,9 @@ impl Workspace {
             )
     }
 
-    fn render_terminal_panel(&self, terminal: &Entity<TerminalView>, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The terminal panel, below a divider that sets its height.
+    fn render_terminal_panel(&self, terminal: &Entity<TerminalPanel>, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let title = terminal.read(cx).title().unwrap_or_else(|| "Shell".into());
 
         div()
             .v_flex()
@@ -2097,46 +2497,7 @@ impl Workspace {
                         }),
                     ),
             )
-            .child(
-                div()
-                    .h_flex()
-                    .items_center()
-                    .gap_2()
-                    .pl_3()
-                    .pr_1()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("TERMINAL"))
-                    .child(div().min_w_0().truncate().child(title))
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("hide-terminal")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::ChevronDown)
-                            .tooltip(format!("Hide terminal ({})", shortcut("`")))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_terminal(&ToggleTerminal, window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("kill-terminal")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Close)
-                            .tooltip("Close terminal (ends the shell)")
-                            .on_click(cx.listener(|this, _, window, cx| this.kill_terminal(window, cx))),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .pl_3()
-                    .pr_1()
-                    .pb_1()
-                    .child(terminal.clone()),
-            )
+            .child(div().flex_1().min_h_0().child(terminal.clone()))
     }
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2157,6 +2518,53 @@ impl Workspace {
                 "UTF-8".to_string(),
             ]
         });
+
+        // Shows or hides the terminal, and is lit while it shows. (A tooltip
+        // stays as it was built while the pointer rests, so it says both.)
+        let terminal_button = div()
+            .id("terminal-status")
+            .flex_none()
+            .cursor_pointer()
+            .when(self.terminal_visible, |button| button.text_color(theme.foreground))
+            .hover(|style| style.text_color(theme.foreground))
+            .child(Icon::new(LucideIcon::SquareTerminal).xsmall())
+            .tooltip(|window, cx| Tooltip::new("Show or hide the terminal (Ctrl+`)").build(window, cx))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.toggle_terminal(&ToggleTerminal, window, cx)
+            }));
+
+        // Shows or hides the credentials.
+        let credentials_button = div()
+            .id("credentials-status")
+            .flex_none()
+            .cursor_pointer()
+            .when(self.credentials_visible, |button| button.text_color(theme.foreground))
+            .hover(|style| style.text_color(theme.foreground))
+            .child(Icon::new(LucideIcon::KeyRound).xsmall())
+            .tooltip(|window, cx| {
+                Tooltip::new(format!("Show or hide credentials ({})", shortcut("Alt+K"))).build(window, cx)
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.toggle_credentials(&ToggleCredentials, window, cx)
+            }));
+
+        // Shows or hides the notes, with the number of to-dos left.
+        let open_todos = self.notes.read(cx).open_count();
+        let notes_button = div()
+            .id("notes-status")
+            .h_flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .cursor_pointer()
+            .when(self.notes_visible, |button| button.text_color(theme.foreground))
+            .hover(|style| style.text_color(theme.foreground))
+            .child(Icon::new(LucideIcon::ListTodo).xsmall())
+            .when(open_todos > 0, |button| button.child(open_todos.to_string()))
+            .tooltip(|window, cx| {
+                Tooltip::new(format!("Show or hide notes and to-dos ({})", shortcut("Alt+B"))).build(window, cx)
+            })
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_notes(&ToggleNotes, window, cx)));
 
         let (message, message_color) = match &self.status {
             Some(status) if status.is_error => (status.message.clone(), theme.danger),
@@ -2222,7 +2630,10 @@ impl Workspace {
                     .flex_none()
                     .gap_4()
                     .when_some(self.fps.as_ref(), |row, meter| row.child(meter.label()))
-                    .children(file_info.into_iter().flatten()),
+                    .children(file_info.into_iter().flatten())
+                    .child(credentials_button)
+                    .child(notes_button)
+                    .child(terminal_button),
             )
     }
 }
@@ -2236,6 +2647,7 @@ impl Render for Workspace {
         }
         // Covers every way a checked setting changes, the system theme included.
         self.sync_menus(cx);
+        self.sync_project_session(cx);
 
         let theme = cx.theme();
         let (background, foreground, border, sidebar_bg, accent) = (
@@ -2248,6 +2660,7 @@ impl Render for Workspace {
         let viewport = window.viewport_size();
         let max_terminal_height = (viewport.height - px(160.)).max(MIN_TERMINAL_HEIGHT);
         let max_sidebar_width = (viewport.width - px(300.)).max(MIN_SIDEBAR_WIDTH);
+        let max_notes_width = (viewport.width - px(300.)).max(MIN_NOTES_WIDTH);
         let terminal = self
             .terminal
             .clone()
@@ -2289,6 +2702,42 @@ impl Render for Workspace {
                 )
         });
 
+        let notes = self.notes_visible.then(|| {
+            div()
+                .h_flex()
+                .flex_none()
+                .h_full()
+                .child(
+                    // Drag to resize the notes.
+                    div()
+                        .id("notes-divider")
+                        .w(px(5.))
+                        .h_full()
+                        .flex_none()
+                        .border_r_1()
+                        .border_color(border)
+                        .cursor(CursorStyle::ResizeColumn)
+                        .hover(|style| style.bg(accent))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                this.resizing = Some(Resize::Notes {
+                                    start_x: event.position.x,
+                                    start_width: this.notes_width,
+                                });
+                                cx.stop_propagation();
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .w(self.notes_width)
+                        .h_full()
+                        .bg(sidebar_bg)
+                        .child(self.notes.clone()),
+                )
+        });
+
         div()
             .v_flex()
             .size_full()
@@ -2296,7 +2745,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::new_file))
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::open_folder))
+            .on_action(cx.listener(Self::open_recent))
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::toggle_notes))
+            .on_action(cx.listener(Self::toggle_credentials))
             .on_action(cx.listener(Self::toggle_changes))
             .on_action(cx.listener(Self::review_changes))
             .on_action(cx.listener(Self::show_timeline))
@@ -2308,6 +2760,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::previous_tab))
             .on_action(cx.listener(Self::toggle_terminal))
+            .on_action(cx.listener(Self::split_terminal_right))
+            .on_action(cx.listener(Self::split_terminal_down))
             .on_action(cx.listener(Self::toggle_soft_wrap))
             .on_action(cx.listener(Self::toggle_line_numbers))
             .on_action(cx.listener(Self::toggle_preview))
@@ -2343,6 +2797,14 @@ impl Render for Workspace {
                     } => {
                         this.sidebar_width = (start_width + (event.position.x - start_x))
                             .clamp(MIN_SIDEBAR_WIDTH, max_sidebar_width);
+                    }
+                    Resize::Notes {
+                        start_x,
+                        start_width,
+                    } => {
+                        // The panel's left edge: dragging left widens it.
+                        this.notes_width = (start_width - (event.position.x - start_x))
+                            .clamp(MIN_NOTES_WIDTH, max_notes_width);
                     }
                 }
                 cx.notify();
@@ -2381,9 +2843,51 @@ impl Render for Workspace {
                             .when_some(terminal, |this, terminal| {
                                 this.child(self.render_terminal_panel(&terminal, cx))
                             }),
-                    ),
+                    )
+                    .children(notes),
             )
             .child(self.render_status_bar(cx))
+            // The list of projects, over everything near the top, as in Zed.
+            .when_some(self.project_picker.as_ref(), |root, (picker, _)| {
+                root.child(
+                    div()
+                        .absolute()
+                        .top(px(48.))
+                        .left_0()
+                        .right_0()
+                        .h_flex()
+                        .justify_center()
+                        .child(picker.clone()),
+                )
+            })
+            // The credentials, over a dimmed window. A click outside closes
+            // them, and doesn't reach what's underneath.
+            .when(self.credentials_visible, |root| {
+                let width = px(800.).min(viewport.width - px(32.));
+                let height = px(520.).min(viewport.height - px(96.)).max(px(240.));
+                root.child(
+                    div()
+                        .id("credentials-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .bg(hsla(0., 0., 0., 0.3))
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| this.hide_credentials(window, cx)),
+                        ),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(48.))
+                        .left_0()
+                        .right_0()
+                        .h_flex()
+                        .justify_center()
+                        .child(div().w(width).h(height).child(self.credentials.clone())),
+                )
+            })
     }
 }
 
@@ -2408,7 +2912,10 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(primary!("n"), NewFile, context),
         KeyBinding::new(primary!("o"), OpenFile, context),
         KeyBinding::new(concat!(primary!("k"), " ", primary!("o")), OpenFolder, context),
+        KeyBinding::new(primary!("alt-o"), OpenRecent, context),
         KeyBinding::new(primary!("b"), ToggleSidebar, context),
+        KeyBinding::new(primary!("alt-b"), ToggleNotes, context),
+        KeyBinding::new(primary!("alt-k"), ToggleCredentials, context),
         KeyBinding::new(primary!("shift-g"), ToggleChanges, context),
         KeyBinding::new(primary!("shift-e"), FocusExplorer, context),
         KeyBinding::new(primary!("s"), SaveFile, context),
@@ -2432,6 +2939,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(primary!("q"), Quit, context),
     ]);
     terminal::bind_keys(cx);
+    terminal_panel::bind_keys(cx);
+    credentials::bind_keys(cx);
     explorer::bind_keys(cx);
     changes::bind_keys(cx);
 }
@@ -2444,6 +2953,7 @@ fn main() {
         .run(move |cx| {
             gpui_kit::init(cx);
             bind_keys(cx);
+            cx.set_global(Projects::load());
 
             // Closing the last window ends the app.
             cx.on_window_closed(|cx, _| {

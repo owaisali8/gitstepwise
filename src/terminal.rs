@@ -37,6 +37,9 @@ gpui_kit::actions!(
         /// interrupts the running program.
         CopyOrInterrupt,
         CopySelection,
+        /// Ctrl+Shift+V. Bound here because the window binds it to the
+        /// Markdown preview, and bindings run before the key handler.
+        PasteClipboard,
     ]
 );
 
@@ -51,6 +54,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-c", CopySelection, context),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-shift-c", CopySelection, context),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-v", PasteClipboard, context),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-v", PasteClipboard, context),
     ]);
 }
 
@@ -94,7 +101,7 @@ impl EventListener for Listener {
 /// Where the grid was last painted, for mapping the mouse to cells.
 #[derive(Clone, Copy)]
 struct Layout {
-    origin: Point<Pixels>,
+    bounds: Bounds<Pixels>,
     cell: Size<Pixels>,
 }
 
@@ -212,6 +219,11 @@ impl TerminalView {
     /// The title the shell set, if any.
     pub fn title(&self) -> Option<SharedString> {
         self.title.clone()
+    }
+
+    /// Where the terminal was last painted; `None` before it's shown.
+    pub fn bounds(&self) -> Option<Bounds<Pixels>> {
+        self.layout.map(|layout| layout.bounds)
     }
 
     /// Move the shell to `dir`, by typing the command for it. (A program
@@ -388,8 +400,9 @@ impl TerminalView {
     /// The grid cell under a window position, and which half of it.
     fn grid_point(&self, position: Point<Pixels>) -> Option<(GridPoint, Side)> {
         let layout = self.layout?;
-        let x = ((position.x - layout.origin.x) / layout.cell.width).max(0.);
-        let y = ((position.y - layout.origin.y) / layout.cell.height).max(0.);
+        let origin = layout.bounds.origin;
+        let x = ((position.x - origin.x) / layout.cell.width).max(0.);
+        let y = ((position.y - origin.y) / layout.cell.height).max(0.);
         let column = (x.floor() as usize).min(self.grid.columns.saturating_sub(1));
         let row = (y.floor() as usize).min(self.grid.lines.saturating_sub(1));
         let side = if x.fract() < 0.5 { Side::Left } else { Side::Right };
@@ -485,6 +498,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::send_back_tab))
             .on_action(cx.listener(Self::copy_or_interrupt))
             .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(|this, _: &PasteClipboard, _, cx| this.paste(cx)))
             // Edit › Copy and Edit › Paste from the menu bar.
             .on_action(cx.listener(|this, _: &input::Copy, _, cx| {
                 this.copy_selection(cx);
@@ -550,13 +564,7 @@ fn layout_frame(
         lines: ((bounds.size.height / cell.height).floor() as usize).max(1),
     };
     entity.update(cx, |terminal, _| {
-        terminal.set_layout(
-            grid,
-            Layout {
-                origin: bounds.origin,
-                cell,
-            },
-        )
+        terminal.set_layout(grid, Layout { bounds, cell })
     });
 
     let term = term.lock();

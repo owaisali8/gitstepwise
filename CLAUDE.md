@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Gitstepwise is a small code editor in Rust on [GPUI Kit](https://crates.io/crates/gpui-kit) (`gpui-kit` 0.10, which wraps `gpui-component` and `gpui-base`) for reviewing uncommitted changes — for example a coding agent's — file by file or edit by edit before committing. It is developed and tested on Windows; macOS and Linux code paths exist but are untried.
+Gitstepwise is a small code editor in Rust on [GPUI Kit](https://crates.io/crates/gpui-kit) (`gpui-kit` 0.10, which wraps `gpui-component` and `gpui-base`) for reviewing uncommitted changes — for example a coding agent's — file by file or edit by edit before committing. It is developed and tested on Windows. On Linux it builds, its tests pass, and the app has been run briefly under X11. macOS is untried.
 
 ## Commands
 
@@ -18,6 +18,7 @@ cargo clippy --all-targets -- -D warnings
 CI (`.github/workflows/ci.yml`, windows-latest) runs `cargo build --locked --all-targets`, `cargo test --locked` and `cargo clippy --locked --all-targets -- -D warnings`. Warnings fail CI, so keep clippy clean. After adding a dependency, run an unlocked build once so `Cargo.lock` is updated before `--locked` runs.
 
 - Git must be on `PATH`: all repository access shells out to `git`.
+- On Linux, GPUI links against xcb, freetype and xkbcommon. Without their development packages the build compiles but fails at linking (`unable to find library -lxkbcommon`). On Debian and Ubuntu, install `libxcb1-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev`.
 - `GITSTEPWISE_FPS=1` shows the frame rate in the status bar.
 - Release builds use `windows_subsystem = "windows"`, so there is no console and `eprintln!` output isn't visible. On Windows, a running `target\release\gitstepwise.exe` can't be overwritten by a rebuild; close it first.
 - `release.yml` builds and publishes a release when a `v*` tag is pushed; the tag must match the version in `Cargo.toml`.
@@ -29,18 +30,19 @@ CI (`.github/workflows/ci.yml`, windows-latest) runs `cargo build --locked --all
 It's one binary crate. `src/main.rs` holds `Workspace`, the root view, which owns everything else:
 
 - **Documents**: one tab per open file, each with its own `EditorState`.
-- **Child views**: `Explorer`, `ChangesView` and the optional `TerminalView`.
+- **Child views**: `Explorer`, `ChangesView`, `NotesPanel`, `CredentialsPanel`, the optional `TerminalPanel` (which holds a `TerminalView` for each split terminal), and the `ProjectPicker` while it shows.
 - **Repository state**: the `git::Repo` and the `Timeline`.
 
 **How the views talk:**
-- **Upward, by events:** child views emit events (`ExplorerEvent`, `ChangesEvent`, `TerminalEvent`) that `Workspace` subscribes to in `Workspace::new`.
+- **Upward, by events:** child views emit events (`ExplorerEvent`, `ChangesEvent`, `NotesEvent`, `CredentialsEvent`, `TerminalPanelEvent`) that `Workspace` subscribes to in `Workspace::new`. The terminal panel is created on first use, so its subscription is made in `start_terminal`. Each `TerminalView` emits `TerminalEvent` to its panel.
 - **Downward, by direct calls:** `Workspace` calls into child views with `entity.update(cx, ...)`.
 - **Rule:** new cross-view behavior goes through an event plus a `Workspace` handler. Child views don't hold references to each other.
 
 **Actions, keys and menus:**
 - **Actions:** each module declares its own with `gpui_kit::actions!` and binds keys in its `bind_keys`. `main.rs`'s `bind_keys` calls all of them.
-- **Key contexts:** each view has its own key context (`"TextEditor"` for the workspace). Bindings in a more specific context win, so the terminal keeps Ctrl+Shift+V for paste.
-- **Keystrokes:** `KeyBinding::new` needs `&'static str` and doesn't resolve `secondary-`. Build keystrokes with the `primary!` macro (`concat!`, Cmd on macOS and Ctrl elsewhere), not `format!`.
+- **Key contexts:** each view has its own key context: `"TextEditor"` for the workspace, and `"Explorer"`, `"Changes"`, `"Terminal"` and `"Credentials"` inside it. The workspace's bindings apply in every child view too.
+- **Taking a key from an outer view:** a binding in a more specific context wins. Key bindings run before `on_key_down` handlers, and a handled action stops there. So a child view that wants a key an outer context binds must bind it in its own context; handling it in `on_key_down` isn't enough. That's why the terminal binds Tab (the window uses it to move focus) and Ctrl+Shift+V (`PasteClipboard`; the workspace binds it to the Markdown preview). The terminal panel's keys are bound in `"Terminal"` too, and their actions bubble up to the panel or the workspace.
+- **Keystrokes:** `KeyBinding::new` needs `&'static str` and doesn't resolve `secondary-`. Build keystrokes with the `primary!` macro (`concat!`, Cmd on macOS and Ctrl elsewhere), not `format!`. It's defined separately in `main.rs` and `explorer.rs`, so a new module that needs it gets its own copy. `KeyBinding::new` panics on a keystroke it can't parse, which stops the app at startup; `terminal_panel.rs` builds its list in a function so a test can check it.
 - **Menus:** the View menu's check marks come from `MenuChecks`. `sync_menus` runs on every render and reinstalls the menus only when a check changes. A new checked or disabled menu state needs a field there.
 
 **Git (`git.rs`):**
@@ -52,6 +54,7 @@ It's one binary crate. `src/main.rs` holds `Workspace`, the root view, which own
 - A `notify` watcher records every write to the repository's tracked or trackable files as a step. Quick bursts of writes are merged.
 - The timeline is stored in `.git/gitstepwise/timeline.json`; the legacy `.git/gpui-editor/` location is still read.
 - It starts afresh when HEAD changes. Reviewed flags live on the steps.
+- `Workspace::timelines` keeps every repository's timeline shown in a session, by root. They keep recording while another project shows, and `check_head` runs when one shows again.
 
 **Changes view (`changes.rs`):**
 - Modes: Timeline, ByFile, AllFiles and History.
@@ -67,9 +70,35 @@ It's one binary crate. `src/main.rs` holds `Workspace`, the root view, which own
 - File operations are in free functions at the bottom of the file; trash uses the `trash` crate.
 - While the inline name field (new, rename) is open, every explorer action must return early via `naming()`. Keys like Enter propagate from the input to the explorer's own bindings.
 
+**Terminal panel (`terminal_panel.rs`):**
+- The terminals are a binary `Tree` of splits. Each split is the kit's `h_resizable` or `v_resizable` group. Its `ResizableState` is kept in the tree, so sizes survive when the tree changes shape.
+- A new shell needs the workspace's starting folder. So splitting goes through the workspace: the header's buttons emit `TerminalPanelEvent::Split`, and the `SplitRight` and `SplitDown` actions bubble up to `Workspace`. Moving between terminals and closing them happen in the panel.
+- The tree logic and `neighbor` (moving by direction) are generic, so the tests use plain numbers.
+- Closing the last terminal emits `Closed`, and the workspace drops the panel. Dropping a `TerminalView` ends its shell.
+
+**Projects (`projects.rs`):**
+- A project is a folder opened with Open Folder, the picker, or as a command-line folder. `Projects` is a GPUI global, loaded in `main` and saved to `projects.json` in the config folder (`dirs::config_dir()`).
+- `Workspace::sync_project_session` runs on every render, like `sync_menus`. It records the open files in the list and saves only when they change.
+- `open_project` asks about unsaved changes with `confirm_close_all`, then `switch_project` swaps the tabs for the ones remembered. The old project's `TerminalPanel` is parked in `parked_terminals` and comes back with it. Events from a parked panel are ignored, except `Closed`.
+- `ProjectPicker` wraps the kit's searchable `ListState`. It leaves out the project showing, so Enter goes back to the previous one.
+
+**Notes (`notes.rs`):**
+- `NotesPanel` shows the notes and to-dos of the explorer's folder. `Workspace` calls `set_project` wherever the explorer's folder changes (`Workspace::new`, `show_folder`, `switch_project`).
+- They're stored on the `Project` in `Projects` (`notes`, `todos`), so they live in the config folder, never in the repository. `set_notes` adds a folder to the list the first time it gets notes.
+- Each change updates the global at once and writes `projects.json` after `SAVE_DELAY`. `on_app_quit` writes anything still pending.
+- `set_value` on a kit input sends no `Change` event, so loading a project's notes doesn't store them back.
+
+**Credentials (`vault.rs`, `credentials.rs`):**
+- `vault.rs` is the store, with no UI: one file, `credentials.vault` in the config folder, shared by every project. It's JSON holding the Argon2id cost and salt, and the credentials encrypted with XChaCha20-Poly1305 under the key made from the master password. A wrong password and an altered file both fail decryption (`VaultError::WrongPassword`). The cost is read from the file, and `Cost::is_sane` refuses one that would ask for absurd memory.
+- Making the key takes a fraction of a second in a release build, so `Vault::create`, `Vault::unlock` and `NewKey::make` run in `cx.background_spawn`. `Cargo.toml` builds `argon2` and `blake2` optimized in debug builds too; tests use a tiny `TEST_COST`.
+- Secrets are wiped where it's cheap: the key is `Zeroizing`, and `Credential` wipes its strings on drop (so it can't be built with `..` from another value). `Credential`'s `Debug` leaves the secret out. Text in the kit's input fields can't be wiped; `clear_form` empties them.
+- `CredentialsPanel` is created once in `Workspace::new`, so the vault stays unlocked across project switches. It shows over a dimmed backdrop that closes it on click. Screens: `Create`, `Locked`, `Open(Vault)`; when open, `Pane` says what the right side shows.
+- The list's rows hold copies without secrets (`Credential::without_secret`), searched by `vault::search`. Enter in the list is caught with `capture_action::<Confirm>` to copy the password: a click on a row confirms it too, but without dispatching `Confirm`, so a click only selects.
+- `touch` restarts the 15-minute auto-lock (`LOCK_AFTER`). A copied password is cleared from the clipboard after `CLEAR_AFTER` (and on quit) if it's still there.
+
 **Markdown preview:**
 - Each `Document` has a `Preview` mode and a `TextViewState`, updated from `InputEvent::Change`.
-- `markdown.rs` resolves links and images relative to the file: links starting with `/` start from the repository root, and `data:` images are cached.
+- `markdown.rs` resolves links and images relative to the file: links starting with `/` start from the repository root (or the explorer's folder outside a repository), and `data:` images are cached.
 - The `TextView` callbacks must be `Send + Sync`, so they can't capture the workspace. Link clicks reach it by dispatching the `OpenLinkedPath` action instead.
 
 **Icons:** only part of the Lucide set ships by default. Any other `LucideIcon` must be added to the `icon_assets!(ExtraIcons, [...])` list in `main.rs`, or it renders blank. The kit's defaults are listed in `default-icons.txt` in the `gpui-kit-assets` crate.
@@ -83,3 +112,5 @@ The API differs from upstream GPUI and from older gpui-component releases. Check
 - Doc comments, UI text and README are written in short, plain sentences that describe what the user sees.
 - Keep the README's feature list, shortcut tables and project layout table in step with changes.
 - Unit tests live in a `tests` module at the end of each file. Clippy rejects items after the test module.
+- In a file with `use gpui_kit::*`, the glob brings in GPUI's `test` attribute, which replaces `#[test]`. The test module there must import names one by one, not `use super::*` (see `explorer.rs`).
+- Some tests are platform-specific (`#[cfg(windows)]` / `#[cfg(not(windows))]`), so the test count differs between Windows and other systems.

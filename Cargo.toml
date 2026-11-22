@@ -31,7 +31,23 @@ gpui-kit = { version = "0.10", features = [
 trash = "5"
 # Images embedded in Markdown as data: URLs, for the preview.
 data-url = "0.3"
+# The config folder, where the list of projects is kept.
+dirs = "6"
+# The credentials vault: a key made from the master password with Argon2id
+# encrypts the vault with XChaCha20-Poly1305. The key is wiped from memory
+# when the vault locks.
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+zeroize = "1"
+base64 = "0.22"
 
 [build-dependencies]
 # Embeds assets/icon.ico in the Windows .exe (see build.rs).
 embed-resource = "3"
+
+# Making the vault's key takes a moment by design; unoptimized, it would
+# take several times as long in debug builds and tests.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

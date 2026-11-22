@@ -46,6 +46,39 @@ was made. Step through until you've seen everything, then commit.
   commits on the branch, newest first, and what each one changed. Right-click a
   file or folder and choose **View History** for only the commits that touched it.
 
+**Projects**
+
+- Open a folder and it becomes a project. Switch to another, as in Zed, with
+  the project's name in the title bar, File → Open Recent…, or Ctrl+Alt+O:
+  type to narrow the list, then Enter.
+- Each project remembers the files open in it. They open again when you come
+  back to it, or when Gitstepwise starts without a folder or file to open.
+- A project's terminals keep running while another project shows, and its edit
+  timeline keeps recording.
+- Each project has its own **notes and to-do list**, in a panel at the right
+  (View → Notes and To-do, the to-do icon in the status bar, or Ctrl+Alt+B).
+  Type a to-do and press Enter; tick it off when it's done. The status bar
+  counts the to-dos left. They're kept with the list of projects, not in the
+  project, so they never show up as changes.
+- The list is kept in `projects.json` in your config folder
+  (`%APPDATA%\Gitstepwise` on Windows).
+
+**Credentials**
+
+- A vault for API keys, passwords, server logins and any other secret, in
+  place of a text file (View → Credentials, the key icon in the status bar, or
+  Ctrl+Alt+K). It belongs to no project: every project sees the same one.
+- The first time, choose a master password. The vault is encrypted with it, and
+  locks again after 15 minutes without use, or with **Lock**.
+- Type to find a credential by its name, username, host or notes. Enter copies
+  its password and closes the vault; Ctrl+Enter copies the username. A copied
+  password is cleared from the clipboard after 30 seconds.
+- Each credential has a name, a username, a password or key, a host or URL, and
+  notes. Only the name is needed.
+- The vault is `credentials.vault`, next to `projects.json`. Back it up like any
+  file: without the master password it can't be read. If you forget the master
+  password, there's no way to get the credentials back.
+
 **The explorer**
 
 - Icons for each kind of file, in their own colors.
@@ -57,7 +90,11 @@ was made. Step through until you've seen everything, then commit.
 
 **The editor itself**
 
-- Tabs, the file explorer, and an integrated terminal.
+- Tabs, the file explorer, and an integrated terminal. The terminal icon at the
+  right end of the status bar shows or hides it.
+- Split the terminal side by side or one above the other, as many times as you
+  like, and drag the dividers to resize. Use the buttons in the terminal's
+  header, View → Split Terminal Right or Down, or the keys below.
 - Syntax highlighting for Rust, TOML, Markdown, Python, JavaScript, TypeScript,
   HTML, CSS, JSON, YAML and shell scripts.
 - A **Markdown preview** (View → Markdown Preview, or the eye button at the
@@ -77,6 +114,8 @@ You need:
   to read your repository.
 - On Windows, the MSVC build tools (installed with Visual Studio or the Build Tools
   for Visual Studio), which Rust uses there anyway.
+- On Linux, the development libraries for xcb, FreeType and xkbcommon. On Debian
+  and Ubuntu: `sudo apt install libxcb1-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev`.
 
 Then:
 
@@ -93,11 +132,13 @@ cargo run --release -- path/to/your/repo        # show a folder in the explorer
 cargo run --release -- src/main.rs README.md    # open files in tabs
 ```
 
-A path that doesn't exist yet opens as a new, empty file at that path.
+A path that doesn't exist yet opens as a new, empty file at that path. With
+nothing given, the last project opens again.
 
 Gitstepwise is developed and tested on Windows. GPUI also runs on macOS and Linux,
-and the code handles both (Cmd shortcuts on macOS, your `$SHELL` in the terminal),
-but they haven't been tried yet.
+and the code handles both (Cmd shortcuts on macOS, your `$SHELL` in the terminal).
+On Linux it builds, its tests pass and it has been run briefly under X11. It hasn't
+been tried on macOS yet.
 
 ## Reviewing an agent's changes
 
@@ -118,6 +159,9 @@ On macOS, use Cmd in place of Ctrl.
 | --- | --- |
 | New file / Open file | Ctrl+N / Ctrl+O |
 | Open folder | Ctrl+K, then Ctrl+O |
+| Switch project | Ctrl+Alt+O |
+| Show or hide notes and to-dos | Ctrl+Alt+B |
+| Show or hide credentials | Ctrl+Alt+K |
 | Save / Save as | Ctrl+S / Ctrl+Shift+S |
 | Close tab | Ctrl+W |
 | Next / previous tab | Ctrl+Tab / Ctrl+Shift+Tab (or Ctrl+PageDown / Ctrl+PageUp) |
@@ -154,6 +198,18 @@ opens. These act on the selected file or folder:
 
 In the **History** view, N and P go to older and newer commits.
 
+In **Credentials**, the arrow keys move through the list, Enter copies the
+password (and closes), Ctrl+Enter copies the username, and Escape closes (or
+leaves a form without saving).
+
+In the **terminal** (as in Windows Terminal):
+
+| Action | Shortcut |
+| --- | --- |
+| Split right / split down | Alt+Shift+= / Alt+Shift+- |
+| Move to the terminal on the left, right, above or below | Alt+arrow keys |
+| Close this terminal (ends its shell) | Ctrl+Shift+W |
+
 ## How the timeline is stored
 
 The timeline is kept in `.git/gitstepwise/timeline.json` inside your repository, so
@@ -172,12 +228,18 @@ starts again from the new commit.
 | Path | What it holds |
 | --- | --- |
 | `src/main.rs` | The window: title bar and menus, tabs, editor, status bar and shortcuts |
-| `src/changes.rs` | The Changes tab: timeline, by-file and all-files review |
+| `src/changes.rs` | The Changes tab: timeline, by-file and all-files review, and commit history |
+| `src/credentials.rs` | The credentials panel: searching, copying and editing credentials |
 | `src/timeline.rs` | The file watcher and the edit timeline |
+| `src/vault.rs` | The encrypted credentials vault and its search |
 | `src/git.rs` | Reading the repository through the `git` command, and line diffs |
 | `src/explorer.rs` | The file explorer |
+| `src/file_icons.rs` | The explorer's icon and color for each kind of file |
 | `src/markdown.rs` | Where the Markdown preview's links and images lead |
+| `src/notes.rs` | Each project's notes and to-do list, in a panel at the right |
+| `src/projects.rs` | The list of projects and the picker to switch between them |
 | `src/terminal.rs` | The integrated terminal |
+| `src/terminal_panel.rs` | The terminal panel: split terminals and their header |
 | `assets/` | The logo, the app icon, and `make-icon.ps1`, which rebuilds the icon |
 
 ## Development
