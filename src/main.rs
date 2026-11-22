@@ -10,11 +10,13 @@
 // behind it. Debug builds keep the console, for `eprintln!` output.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod branches;
 mod changes;
 mod credentials;
 mod explorer;
 mod file_icons;
 mod git;
+mod git_branches;
 mod markdown;
 mod notes;
 mod projects;
@@ -24,8 +26,10 @@ mod timeline;
 mod vault;
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -37,6 +41,7 @@ use gpui_kit::component::input::{
     OverviewRulerDecoration, OverviewRulerDecorationCollection, OverviewRulerLane, Position,
 };
 use gpui_kit::component::menu::AppMenuBar;
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::tooltip::Tooltip;
@@ -44,10 +49,15 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use branches::{
+    BranchesEvent, BranchesPanel, Choice, MergeDialog, MergeEvent, MessageDialog, MessageEvent, NewBranchDialog,
+    NewBranchEvent,
+};
 use changes::{ChangedFile, ChangesEvent, ChangesView, Mode, Select};
 use credentials::{CredentialsEvent, CredentialsPanel};
 use timeline::Timeline;
 use explorer::{Explorer, ExplorerEvent};
+use git_branches::{Branch, MergeOutcome, SyncStatus};
 use markdown::{EmbeddedImages, Links, Target};
 use notes::{NotesEvent, NotesPanel};
 use projects::{ProjectPicker, ProjectPickerEvent, Projects};
@@ -67,6 +77,13 @@ gpui_kit::actions!(
         /// Show or hide the credentials: passwords, API keys and logins,
         /// the same in every project.
         ToggleCredentials,
+        /// Show the list of branches, to switch to one.
+        ShowBranches,
+        NewBranch,
+        MergeIntoCurrentBranch,
+        Fetch,
+        Pull,
+        Push,
         ToggleChanges,
         ReviewChanges,
         ShowTimeline,
@@ -131,8 +148,11 @@ gpui_kit::assets::icon_assets!(
         FileSpreadsheet,
         FileTerminal,
         FileText,
+        CloudUpload,
         FolderPlus,
         GitBranch,
+        GitMerge,
+        GitPullRequest,
         KeyRound,
         ListTodo,
         Lock,
@@ -202,6 +222,15 @@ fn language_label(id: &str) -> &'static str {
         .map_or("Plain Text", |(_, _, label)| label)
 }
 
+/// "1 commit", "3 commits".
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
 /// "Ctrl+S" on Windows and Linux, "Cmd+S" on macOS.
 fn shortcut(keys: &str) -> String {
     let modifier = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
@@ -226,6 +255,8 @@ struct MenuChecks {
     terminal: bool,
     soft_wrap: bool,
     line_numbers: bool,
+    /// The explorer's folder is in a Git repository, for the Branch menu.
+    repo: bool,
     /// The active tab is a Markdown file, and how it shows.
     markdown: bool,
     preview: Preview,
@@ -262,6 +293,16 @@ fn app_menus(checks: MenuChecks) -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("Find", edit::Search),
             MenuItem::action("Replace", edit::Replace),
+        ]),
+        Menu::new("Branch").items([
+            MenuItem::action("New Branch…", NewBranch).disabled(!checks.repo),
+            MenuItem::action("Switch Branch…", ShowBranches).disabled(!checks.repo),
+            MenuItem::separator(),
+            MenuItem::action("Merge into Current Branch…", MergeIntoCurrentBranch).disabled(!checks.repo),
+            MenuItem::separator(),
+            MenuItem::action("Fetch", Fetch).disabled(!checks.repo),
+            MenuItem::action("Pull", Pull).disabled(!checks.repo),
+            MenuItem::action("Push", Push).disabled(!checks.repo),
         ]),
         Menu::new("View").items([
             MenuItem::action("Explorer", ToggleSidebar).checked(checks.sidebar),
@@ -305,6 +346,9 @@ struct ParkedTerminal {
 
 /// A step that runs once unsaved changes have been saved or discarded.
 type Continuation = Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
+
+/// What happens when a button of a `MessageDialog` is pressed, given its index.
+type DialogChoice = Box<dyn FnOnce(&mut Workspace, usize, &mut Window, &mut Context<Workspace>)>;
 
 /// Identifies a document across tab moves and closes.
 type DocId = usize;
@@ -463,6 +507,23 @@ struct Workspace {
     notes: Entity<NotesPanel>,
     notes_visible: bool,
     notes_width: Pixels,
+    /// The list of branches under the title bar's branch button, and where
+    /// that button was last drawn, to put the list under it.
+    branches: Entity<BranchesPanel>,
+    branches_visible: bool,
+    branch_button: Rc<Cell<Option<Bounds<Pixels>>>>,
+    merge_dialog: Option<(Entity<MergeDialog>, Subscription)>,
+    new_branch_dialog: Option<(Entity<NewBranchDialog>, Subscription)>,
+    /// A question or message about a branch operation.
+    message_dialog: Option<(Entity<MessageDialog>, Subscription)>,
+    /// The checked-out branch, `None` when no branch is (unlike `branch`,
+    /// which then holds the commit).
+    on_branch: Option<String>,
+    /// How the branch stands against its remote, for the fetch button.
+    sync: Option<SyncStatus>,
+    /// A branch operation running, and what it's doing.
+    git_busy: Option<SharedString>,
+    _git_task: Option<Task<()>>,
     /// The credentials vault, over the window while it shows. It belongs to
     /// no project, and stays unlocked across project switches.
     credentials: Entity<CredentialsPanel>,
@@ -546,10 +607,12 @@ impl Workspace {
             notes
         });
         let credentials = cx.new(|cx| CredentialsPanel::new(window, cx));
+        let branches = cx.new(|cx| BranchesPanel::new(window, cx));
         let mut subscriptions = vec![
             cx.subscribe_in(&explorer, window, Self::on_explorer_event),
             cx.subscribe_in(&notes, window, Self::on_notes_event),
             cx.subscribe_in(&credentials, window, Self::on_credentials_event),
+            cx.subscribe_in(&branches, window, Self::on_branches_event),
             // The status bar counts the to-dos left.
             cx.observe(&notes, |_, _, cx| cx.notify()),
             // Pick up files created elsewhere when the user comes back.
@@ -595,6 +658,16 @@ impl Workspace {
             notes,
             notes_visible: false,
             notes_width: px(300.),
+            branches,
+            branches_visible: false,
+            branch_button: Rc::default(),
+            merge_dialog: None,
+            new_branch_dialog: None,
+            message_dialog: None,
+            on_branch: None,
+            sync: None,
+            git_busy: None,
+            _git_task: None,
             credentials,
             credentials_visible: false,
             terminal: None,
@@ -1039,6 +1112,553 @@ impl Workspace {
         }
     }
 
+    // ---- Branches ------------------------------------------------------------
+
+    /// Show the list of branches under the branch button, or hide it.
+    fn show_branches(&mut self, _: &ShowBranches, window: &mut Window, cx: &mut Context<Self>) {
+        if self.branches_visible {
+            self.hide_branches(window, cx);
+            return;
+        }
+        if self.repo.is_none() {
+            self.set_status("This folder isn't in a Git repository.", true, cx);
+            return;
+        }
+        self.close_picker(window, cx);
+        self.hide_credentials(window, cx);
+        self.branches_visible = true;
+        self.branches.update(cx, |panel, cx| panel.shown(window, cx));
+        cx.notify();
+    }
+
+    fn hide_branches(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.branches_visible {
+            return;
+        }
+        self.branches_visible = false;
+        if self.branches.read(cx).contains_focus(window, cx) {
+            self.focus_active(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn on_branches_event(
+        &mut self,
+        _: &Entity<BranchesPanel>,
+        event: &BranchesEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.hide_branches(window, cx);
+        match event.clone() {
+            BranchesEvent::Switch(branch) => self.switch_branch(branch, window, cx),
+            BranchesEvent::NewBranch(typed) => self.open_new_branch(&typed, window, cx),
+            BranchesEvent::ChooseMerge => self.merge_into_current_branch(&MergeIntoCurrentBranch, window, cx),
+            BranchesEvent::RestoreStash(stash) => self.restore_stash(stash, window, cx),
+            BranchesEvent::DiscardStash(stash) => self.discard_stash(stash, window, cx),
+            BranchesEvent::AbortMerge => self.abort_merge(window, cx),
+            BranchesEvent::Close => {}
+        }
+    }
+
+    fn new_branch(&mut self, _: &NewBranch, window: &mut Window, cx: &mut Context<Self>) {
+        self.hide_branches(window, cx);
+        self.open_new_branch("", window, cx);
+    }
+
+    /// The "Create a branch" dialog, with `typed` as the name to start from.
+    fn open_new_branch(&mut self, typed: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else {
+            self.set_status("This folder isn't in a Git repository.", true, cx);
+            return;
+        };
+        let dialog = cx.new(|cx| NewBranchDialog::new(repo, typed, window, cx));
+        let subscription = cx.subscribe_in(&dialog, window, |this, _, event: &NewBranchEvent, window, cx| {
+            this.close_dialogs(window, cx);
+            if let NewBranchEvent::Create { name, base } = event.clone() {
+                this.create_branch(name, base, window, cx);
+            }
+        });
+        dialog.read(cx).focus_handle(cx).focus(window, cx);
+        self.new_branch_dialog = Some((dialog, subscription));
+        cx.notify();
+    }
+
+    fn merge_into_current_branch(&mut self, _: &MergeIntoCurrentBranch, window: &mut Window, cx: &mut Context<Self>) {
+        self.hide_branches(window, cx);
+        let Some(repo) = self.repo.clone() else {
+            self.set_status("This folder isn't in a Git repository.", true, cx);
+            return;
+        };
+        let Some(into) = self.on_branch.clone() else {
+            self.set_status("Check out a branch to merge into first.", true, cx);
+            return;
+        };
+        let dialog = cx.new(|cx| MergeDialog::new(repo, into, window, cx));
+        let subscription = cx.subscribe_in(&dialog, window, |this, _, event: &MergeEvent, window, cx| {
+            this.close_dialogs(window, cx);
+            if let MergeEvent::Merge(from) = event.clone() {
+                this.merge_branch(from, window, cx);
+            }
+        });
+        dialog.read(cx).focus_handle(cx).focus(window, cx);
+        self.merge_dialog = Some((dialog, subscription));
+        cx.notify();
+    }
+
+    fn close_dialogs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let closed = [
+            self.merge_dialog.take().is_some(),
+            self.new_branch_dialog.take().is_some(),
+            self.message_dialog.take().is_some(),
+        ];
+        if closed.contains(&true) {
+            self.focus_active(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Check out `branch`, once unsaved tabs are saved or their changes
+    /// dropped. Changes not committed come along, or stay behind on the
+    /// branch they were made on, as the user chooses.
+    fn switch_branch(&mut self, branch: Branch, window: &mut Window, cx: &mut Context<Self>) {
+        if branch.remote.is_none() && self.on_branch.as_deref() == Some(branch.name.as_str()) {
+            return;
+        }
+        self.confirm_close_all(
+            window,
+            cx,
+            Box::new(move |this, window, cx| {
+                let Some(repo) = this.repo.clone() else {
+                    return;
+                };
+                let changed = cx.background_spawn(async move { !repo.changed_paths().is_empty() });
+                cx.spawn_in(window, async move |this, cx| {
+                    let changed = changed.await;
+                    this.update_in(cx, |this, window, cx| {
+                        if changed {
+                            this.ask_about_changes(branch, window, cx);
+                        } else {
+                            this.run_switch(branch, false, window, cx);
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }),
+        );
+    }
+
+    /// Show a question or message about a branch operation. `then` gets
+    /// the index of the button pressed; closing the dialog calls nothing.
+    fn ask(
+        &mut self,
+        title: impl Into<SharedString>,
+        body: impl Into<SharedString>,
+        buttons: &[(&str, Choice)],
+        then: DialogChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.hide_branches(window, cx);
+        let buttons = buttons
+            .iter()
+            .map(|(label, choice)| (SharedString::from(label.to_string()), *choice))
+            .collect();
+        let (title, body) = (title.into(), body.into());
+        let dialog = cx.new(|cx| MessageDialog::new(title, body, buttons, cx));
+        let mut then = Some(then);
+        let subscription = cx.subscribe_in(&dialog, window, move |this, _, event: &MessageEvent, window, cx| {
+            this.close_dialogs(window, cx);
+            if let (MessageEvent::Chose(ix), Some(then)) = (event, then.take()) {
+                then(this, *ix, window, cx);
+            }
+        });
+        dialog.read(cx).focus_handle(cx).focus(window, cx);
+        self.merge_dialog = None;
+        self.new_branch_dialog = None;
+        self.message_dialog = Some((dialog, subscription));
+        cx.notify();
+    }
+
+    /// Switching with changes not committed: bring them along, or leave them
+    /// on the branch they were made on, as GitHub Desktop asks.
+    fn ask_about_changes(&mut self, branch: Branch, window: &mut Window, cx: &mut Context<Self>) {
+        let from = self.on_branch.clone().unwrap_or_else(|| "this commit".into());
+        let to = branch.name.clone();
+        let leave = format!("Leave My Changes on {from}");
+        let bring = format!("Bring My Changes to {to}");
+        self.ask(
+            format!("You have changes on {from}"),
+            format!(
+                "Leave them on {from}, put aside (stashed) until you come back to it, or bring them \
+                 with you to {to}?"
+            ),
+            &[("Cancel", Choice::Plain), (&leave, Choice::Plain), (&bring, Choice::Primary)],
+            Box::new(move |this, ix, window, cx| match ix {
+                1 => this.run_switch(branch, true, window, cx),
+                2 => this.run_switch(branch, false, window, cx),
+                _ => {}
+            }),
+            window,
+            cx,
+        );
+    }
+
+    fn run_switch(&mut self, branch: Branch, leave_changes: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let from = self.on_branch.clone().unwrap_or_else(|| "HEAD".into());
+        let name = branch.name.clone();
+        let shown = name.clone();
+        self.run_git(
+            format!("Switching to {name}…"),
+            move |repo| {
+                if leave_changes {
+                    repo.stash_changes(&from)?;
+                }
+                if let Err(err) = repo.switch_to(&branch) {
+                    // Nothing switched: put the changes back.
+                    if leave_changes && let Some(stash) = repo.stash_for(&from) {
+                        let _ = repo.restore_stash(&stash);
+                    }
+                    return Err(err);
+                }
+                Ok(repo.stash_for(&name).is_some())
+            },
+            move |this, result, window, cx| match result {
+                Ok(true) => this.set_status(
+                    format!("Switched to {shown}. You left changes on it: restore them from the branch list."),
+                    false,
+                    cx,
+                ),
+                Ok(false) => this.set_status(format!("Switched to {shown}."), false, cx),
+                Err(err) => this.git_failed(format!("Couldn't switch to {shown}"), err, window, cx),
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn create_branch(&mut self, name: String, base: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        // From the current branch, no file changes.
+        let files_change = base.is_some();
+        let create = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+            let shown = name.clone();
+            this.run_git(
+                format!("Creating {name}…"),
+                move |repo| {
+                    let name = repo.check_branch_name(&name)?;
+                    repo.create_branch(&name, base.as_deref())
+                },
+                move |this, result, window, cx| match result {
+                    Ok(()) => this.set_status(format!("Created {shown}, and switched to it."), false, cx),
+                    Err(err) => this.git_failed(format!("Couldn't create {shown}"), err, window, cx),
+                },
+                window,
+                cx,
+            );
+        };
+        if files_change {
+            self.confirm_close_all(window, cx, Box::new(create));
+        } else {
+            create(self, window, cx);
+        }
+    }
+
+    fn merge_branch(&mut self, from: String, window: &mut Window, cx: &mut Context<Self>) {
+        let into = self.on_branch.clone().unwrap_or_default();
+        self.confirm_close_all(
+            window,
+            cx,
+            Box::new(move |this, window, cx| {
+                let branch = from.clone();
+                this.run_git(
+                    format!("Merging {from} into {into}…"),
+                    move |repo| repo.merge(&branch),
+                    move |this, result, window, cx| match result {
+                        Ok(outcome) => this.merged(&format!("Merged {from} into {into}."), outcome, window, cx),
+                        Err(err) => this.git_failed(format!("Couldn't merge {from}"), err, window, cx),
+                    },
+                    window,
+                    cx,
+                );
+            }),
+        );
+    }
+
+    /// Say how a merge or pull went.
+    fn merged(&mut self, success: &str, outcome: MergeOutcome, window: &mut Window, cx: &mut Context<Self>) {
+        match outcome {
+            MergeOutcome::UpToDate => self.set_status("Already up to date.", false, cx),
+            MergeOutcome::FastForward | MergeOutcome::Merged => self.set_status(success.to_string(), false, cx),
+            MergeOutcome::Conflicts(files) => {
+                let count = files.len();
+                let listed = files.iter().take(8).cloned().collect::<Vec<_>>().join("\n");
+                let more = if count > 8 { format!("\n…and {} more", count - 8) } else { String::new() };
+                self.set_status(
+                    format!("Merge conflicts in {count} {}.", if count == 1 { "file" } else { "files" }),
+                    true,
+                    cx,
+                );
+                self.ask(
+                    "Resolve the merge conflicts",
+                    format!(
+                        "These files have conflicts:\n{listed}{more}\n\nEdit them to keep what you want, \
+                         then commit. To undo the merge instead, use Abort Merge in the branch list."
+                    ),
+                    &[("OK", Choice::Primary)],
+                    Box::new(|_, _, _, _| {}),
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn abort_merge(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ask(
+            "Abort the merge?",
+            "Your files go back to how they were before it. Conflicts you've resolved are lost.",
+            &[("Cancel", Choice::Plain), ("Abort Merge", Choice::Danger)],
+            Box::new(|this, ix, window, cx| {
+                if ix != 1 {
+                    return;
+                }
+                this.run_git(
+                    "Aborting the merge…".into(),
+                    |repo| repo.abort_merge(),
+                    |this, result, window, cx| match result {
+                        Ok(()) => this.set_status("Aborted the merge.", false, cx),
+                        Err(err) => this.git_failed("Couldn't abort the merge".into(), err, window, cx),
+                    },
+                    window,
+                    cx,
+                );
+            }),
+            window,
+            cx,
+        );
+    }
+
+    fn restore_stash(&mut self, stash: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_close_all(
+            window,
+            cx,
+            Box::new(move |this, window, cx| {
+                this.run_git(
+                    "Restoring your changes…".into(),
+                    move |repo| repo.restore_stash(&stash),
+                    |this, result, window, cx| match result {
+                        Ok(()) => this.set_status("Restored the changes you left on this branch.", false, cx),
+                        Err(err) => this.git_failed("Couldn't restore your changes".into(), err, window, cx),
+                    },
+                    window,
+                    cx,
+                );
+            }),
+        );
+    }
+
+    fn discard_stash(&mut self, stash: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.ask(
+            "Discard the changes you left on this branch?",
+            "They can't be brought back.",
+            &[("Cancel", Choice::Plain), ("Discard", Choice::Danger)],
+            Box::new(move |this, ix, window, cx| {
+                if ix != 1 {
+                    return;
+                }
+                this.run_git(
+                    "Discarding the changes…".into(),
+                    move |repo| repo.drop_stash(&stash),
+                    |this, result, window, cx| match result {
+                        Ok(()) => this.set_status("Discarded the changes left on this branch.", false, cx),
+                        Err(err) => this.git_failed("Couldn't discard the changes".into(), err, window, cx),
+                    },
+                    window,
+                    cx,
+                );
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// The fetch button: pull when the remote has commits this branch
+    /// doesn't, publish a branch that isn't on the remote yet, push commits
+    /// the remote doesn't have, or else fetch.
+    fn sync_with_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sync) = &self.sync else {
+            return;
+        };
+        if sync.behind > 0 {
+            self.pull(&Pull, window, cx);
+        } else if (sync.upstream.is_none() && self.on_branch.is_some()) || sync.ahead > 0 {
+            self.push(&Push, window, cx);
+        } else {
+            self.fetch(&Fetch, window, cx);
+        }
+    }
+
+    fn fetch(&mut self, _: &Fetch, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(remote) = self.sync.as_ref().map(|sync| sync.remote.clone()) else {
+            self.set_status("The repository has no remote to fetch from.", true, cx);
+            return;
+        };
+        let shown = remote.clone();
+        self.run_git(
+            format!("Fetching {remote}…"),
+            move |repo| repo.fetch(&remote),
+            move |this, result, window, cx| match result {
+                Ok(()) => this.set_status(format!("Fetched {shown}."), false, cx),
+                Err(err) => this.git_failed(format!("Couldn't fetch {shown}"), err, window, cx),
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn pull(&mut self, _: &Pull, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sync) = self.sync.clone() else {
+            self.set_status("The repository has no remote to pull from.", true, cx);
+            return;
+        };
+        if sync.upstream.is_none() {
+            self.set_status("This branch isn't on the remote yet: publish it first.", true, cx);
+            return;
+        }
+        self.confirm_close_all(
+            window,
+            cx,
+            Box::new(move |this, window, cx| {
+                let remote = sync.remote.clone();
+                this.run_git(
+                    format!("Pulling from {remote}…"),
+                    |repo| repo.pull(),
+                    move |this, result, window, cx| match result {
+                        Ok(outcome) => this.merged(&format!("Pulled from {remote}."), outcome, window, cx),
+                        Err(err) => this.git_failed(format!("Couldn't pull from {remote}"), err, window, cx),
+                    },
+                    window,
+                    cx,
+                );
+            }),
+        );
+    }
+
+    fn push(&mut self, _: &Push, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(sync), Some(branch)) = (self.sync.clone(), self.on_branch.clone()) else {
+            self.set_status("There's no branch to push, or no remote to push to.", true, cx);
+            return;
+        };
+        let publish = sync.upstream.is_none();
+        let remote = sync.remote.clone();
+        let busy = if publish {
+            format!("Publishing {branch} to {remote}…")
+        } else {
+            format!("Pushing to {remote}…")
+        };
+        let shown = branch.clone();
+        self.run_git(
+            busy,
+            move |repo| repo.push(&sync, &branch),
+            move |this, result, window, cx| match result {
+                Ok(()) if publish => this.set_status(format!("Published {shown} to {remote}."), false, cx),
+                Ok(()) => this.set_status(format!("Pushed {shown} to {remote}."), false, cx),
+                Err(err) => this.git_failed(format!("Couldn't push to {remote}"), err, window, cx),
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Run a branch operation in the background, one at a time, then show
+    /// the files and the repository as they now are, and call `done`.
+    fn run_git<T: Send + 'static>(
+        &mut self,
+        busy: String,
+        operation: impl FnOnce(&git::Repo) -> Result<T, String> + Send + 'static,
+        done: impl FnOnce(&mut Self, Result<T, String>, &mut Window, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repo) = self.repo.clone() else {
+            self.set_status("This folder isn't in a Git repository.", true, cx);
+            return;
+        };
+        if let Some(running) = &self.git_busy {
+            self.set_status(format!("Still busy: {running}"), true, cx);
+            return;
+        }
+        self.git_busy = Some(busy.clone().into());
+        self.set_status(busy, false, cx);
+        self._git_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = cx.background_spawn(async move { operation(&repo) }).await;
+            this.update_in(cx, |this, window, cx| {
+                this.git_busy = None;
+                this.after_git(window, cx);
+                done(this, result, window, cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// A branch operation failed: say so in the status bar, and in full in a
+    /// dialog, since Git's reasons run to several lines.
+    fn git_failed(&mut self, title: String, err: String, window: &mut Window, cx: &mut Context<Self>) {
+        let first = err.lines().next().unwrap_or_default();
+        self.set_status(format!("{title}: {first}"), true, cx);
+        self.ask(
+            format!("{title}."),
+            err,
+            &[("OK", Choice::Primary)],
+            Box::new(|_, _, _, _| {}),
+            window,
+            cx,
+        );
+    }
+
+    /// After a checkout, merge or pull: the files, the branch, the changes and
+    /// the timeline as they now are.
+    fn after_git(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reload_clean_documents(window, cx);
+        self.explorer.update(cx, |explorer, cx| explorer.refresh(cx));
+        self.repo_stamp = self.repo.as_ref().map(git::Repo::stamp);
+        self.refresh_git(cx);
+        if let Some(timeline) = &self.timeline {
+            timeline.update(cx, |timeline, cx| timeline.check_head(cx));
+        }
+        self.changes.update(cx, |view, cx| view.refresh_history(cx));
+        self.branches.update(cx, |panel, cx| panel.load(cx));
+        cx.notify();
+    }
+
+    /// Show open files as they now are on disk. Tabs with unsaved changes
+    /// keep them; the tab of a file that's gone closes.
+    fn reload_clean_documents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut gone = Vec::new();
+        for ix in 0..self.documents.len() {
+            let doc = &self.documents[ix];
+            let Some(path) = doc.path.clone().filter(|_| !doc.dirty) else {
+                continue;
+            };
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    if doc.editor.read(cx).value().as_ref() != text {
+                        let editor = doc.editor.clone();
+                        editor.update(cx, |state, cx| state.set_value(text, window, cx));
+                        self.documents[ix].dirty = false;
+                        self.documents[ix].update_rendered(cx);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => gone.push(doc.id),
+                Err(_) => {}
+            }
+        }
+        for id in gone {
+            self.close_document(id, window, cx);
+        }
+    }
+
     fn focus_explorer(&mut self, _: &FocusExplorer, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_visible = true;
         self.explorer.read(cx).focus_handle(cx).focus(window, cx);
@@ -1329,6 +1949,7 @@ impl Workspace {
             terminal: self.terminal_visible,
             soft_wrap: self.soft_wrap,
             line_numbers: self.line_numbers,
+            repo: self.repo.is_some(),
             markdown: doc.is_some_and(Document::is_markdown),
             preview: doc.map_or(Preview::Off, |doc| doc.preview),
             dark: cx.theme().is_dark(),
@@ -1566,7 +2187,11 @@ impl Workspace {
                         view.set_timeline(timeline, cx);
                         view.set_repo(repo.clone(), cx);
                     });
+                    this.branches.update(cx, |panel, cx| panel.set_repo(repo.clone(), cx));
                     this.explorer.update(cx, |explorer, cx| explorer.set_repo(repo, cx));
+                    this.merge_dialog = None;
+                    this.new_branch_dialog = None;
+                    this.branches_visible = false;
                 }
                 this.refresh_changes(cx);
             })
@@ -1718,6 +2343,8 @@ impl Workspace {
     fn refresh_changes(&mut self, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.clone() else {
             self.branch = None;
+            self.on_branch = None;
+            self.sync = None;
             self.changed_files = 0;
             self.changes.update(cx, |view, cx| view.set_not_a_repository(cx));
             cx.notify();
@@ -1734,7 +2361,7 @@ impl Workspace {
 
         let root = repo.root.clone();
         self._changes_task = Some(cx.spawn(async move |this, cx| {
-            let (branch, count, patches) = cx
+            let (branch, count, patches, on_branch, sync) = cx
                 .background_spawn(async move {
                     let unsaved: Vec<(String, String)> = unsaved
                         .into_iter()
@@ -1757,13 +2384,15 @@ impl Workspace {
                             .collect::<Vec<_>>()
                     });
                     let count = patch.as_ref().map_or(paths.len(), Vec::len);
-                    (repo.branch(), count, patch)
+                    (repo.branch(), count, patch, repo.current_branch(), repo.sync_status())
                 })
                 .await;
 
             this.update(cx, |this, cx| {
                 let branch = branch.map(SharedString::from);
                 this.branch = branch.clone();
+                this.on_branch = on_branch;
+                this.sync = sync;
                 this.changed_files = count;
                 if let Some(patches) = patches {
                     let mut files = Vec::new();
@@ -2267,7 +2896,8 @@ impl Workspace {
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.open_recent(&OpenRecent, window, cx)
                                     })),
-                            ),
+                            )
+                            .children(self.render_branch_buttons(cx)),
                     ),
             )
             .child(
@@ -2281,6 +2911,182 @@ impl Workspace {
                     .text_color(muted)
                     .child(div().truncate().child(self.window_title())),
             )
+    }
+
+    /// A button in the title bar like GitHub Desktop's toolbar: an icon, a
+    /// small caption over a title, and maybe a caret.
+    fn toolbar_button(
+        id: &'static str,
+        icon: impl IntoElement,
+        caption: impl Into<SharedString>,
+        title: impl Into<SharedString>,
+        open: bool,
+        caret: bool,
+        cx: &App,
+    ) -> Stateful<Div> {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        div()
+            .id(id)
+            .h_flex()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .h(TITLE_BAR_HEIGHT)
+            .pl_3()
+            .pr_2()
+            .min_w(px(150.))
+            .max_w(px(240.))
+            .border_l_1()
+            .border_color(theme.title_bar_border)
+            .cursor_pointer()
+            .when(open, |button| button.bg(theme.secondary))
+            .hover(|style| style.bg(theme.secondary_hover))
+            .child(div().flex_none().text_color(muted).child(icon))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .line_height(px(12.))
+                            .text_color(muted)
+                            .truncate()
+                            .child(caption.into()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .line_height(px(16.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .truncate()
+                            .child(title.into()),
+                    ),
+            )
+            .when(caret, |button| {
+                button.child(
+                    Icon::new(if open { IconName::ChevronUp } else { IconName::ChevronDown })
+                        .xsmall()
+                        .text_color(muted),
+                )
+            })
+    }
+
+    /// "Current branch" and "Fetch origin", as in GitHub Desktop, while the
+    /// folder is in a repository.
+    fn render_branch_buttons(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        if self.repo.is_none() {
+            return Vec::new();
+        }
+        let muted = cx.theme().muted_foreground;
+        let title = match (&self.on_branch, &self.branch) {
+            (Some(branch), _) => branch.clone(),
+            (None, Some(commit)) => format!("Detached at {commit}"),
+            (None, None) => "No commits yet".into(),
+        };
+        // Remember where the button is, to put the list under it.
+        let bounds = self.branch_button.clone();
+        let branch_button = div()
+            .relative()
+            .flex_none()
+            .child(
+                Self::toolbar_button(
+                    "current-branch",
+                    Icon::new(LucideIcon::GitBranch).small(),
+                    "Current branch",
+                    title,
+                    self.branches_visible,
+                    true,
+                    cx,
+                )
+                .tooltip(|window, cx| {
+                    Tooltip::new(format!("Switch, create or merge branches ({})", shortcut("Shift+B"))).build(window, cx)
+                })
+                .on_click(cx.listener(|this, _, window, cx| this.show_branches(&ShowBranches, window, cx))),
+            )
+            .child(
+                canvas(move |rect, _, _| bounds.set(Some(rect)), |_, _, _, _| {})
+                    .absolute()
+                    .size_full(),
+            );
+
+        let mut buttons = vec![branch_button.into_any_element()];
+        let Some(sync) = &self.sync else {
+            return buttons;
+        };
+        let remote = sync.remote.clone();
+        let fetched = match sync.fetched {
+            Some(time) => {
+                let seconds = time.elapsed().map_or(0, |elapsed| elapsed.as_secs() as i64);
+                format!("Last fetched {}", branches::ago(seconds))
+            }
+            None => "Never fetched".into(),
+        };
+        let counts = |sync: &SyncStatus| {
+            let mut counts = String::new();
+            if sync.behind > 0 {
+                counts.push_str(&format!("{}↓", sync.behind));
+            }
+            if sync.ahead > 0 {
+                counts.push_str(&format!(" {}↑", sync.ahead));
+            }
+            counts.trim().to_string()
+        };
+        let (icon, title, caption, tooltip): (AnyElement, String, String, String) = if let Some(busy) = &self.git_busy {
+            (
+                Spinner::new().small().into_any_element(),
+                busy.trim_end_matches('…').to_string(),
+                "Working…".into(),
+                busy.to_string(),
+            )
+        } else if sync.behind > 0 {
+            (
+                Icon::new(IconName::ArrowDown).small().into_any_element(),
+                format!("Pull {remote}"),
+                fetched,
+                format!("Pull {} from {remote} ({})", plural(sync.behind, "commit"), shortcut("Shift+P")),
+            )
+        } else if sync.upstream.is_none() && self.on_branch.is_some() {
+            (
+                Icon::new(LucideIcon::CloudUpload).small().into_any_element(),
+                "Publish branch".into(),
+                format!("Publish this branch to {remote}"),
+                format!("Publish this branch to {remote} ({})", shortcut("P")),
+            )
+        } else if sync.ahead > 0 {
+            (
+                Icon::new(IconName::ArrowUp).small().into_any_element(),
+                format!("Push {remote}"),
+                fetched,
+                format!("Push {} to {remote} ({})", plural(sync.ahead, "commit"), shortcut("P")),
+            )
+        } else {
+            (
+                Icon::new(IconName::RefreshCw).small().into_any_element(),
+                format!("Fetch {remote}"),
+                fetched,
+                format!("Check {remote} for new commits"),
+            )
+        };
+        let badge = counts(sync);
+        let sync_button = Self::toolbar_button("sync-remote", icon, caption, title, false, false, cx)
+            .when(!badge.is_empty() && self.git_busy.is_none(), |button| {
+                button.child(
+                    div()
+                        .flex_none()
+                        .px_1p5()
+                        .rounded_full()
+                        .bg(cx.theme().secondary)
+                        .text_xs()
+                        .text_color(muted)
+                        .child(badge),
+                )
+            })
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .on_click(cx.listener(|this, _, window, cx| this.sync_with_remote(window, cx)));
+        buttons.push(sync_button.into_any_element());
+        buttons
     }
 
     /// A tab for each open file, then the Changes tab if it's open.
@@ -2749,6 +3555,12 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_notes))
             .on_action(cx.listener(Self::toggle_credentials))
+            .on_action(cx.listener(Self::show_branches))
+            .on_action(cx.listener(Self::new_branch))
+            .on_action(cx.listener(Self::merge_into_current_branch))
+            .on_action(cx.listener(Self::fetch))
+            .on_action(cx.listener(Self::pull))
+            .on_action(cx.listener(Self::push))
             .on_action(cx.listener(Self::toggle_changes))
             .on_action(cx.listener(Self::review_changes))
             .on_action(cx.listener(Self::show_timeline))
@@ -2860,6 +3672,83 @@ impl Render for Workspace {
                         .child(picker.clone()),
                 )
             })
+            // The branch list, under its button and down to the bottom, over
+            // a dimmed window below the title bar.
+            .when(self.branches_visible, |root| {
+                let width = px(440.);
+                let left = self
+                    .branch_button
+                    .get()
+                    .map_or(px(240.), |bounds| bounds.left())
+                    .min(viewport.width - width - px(8.))
+                    .max(px(8.));
+                root.child(
+                    div()
+                        .id("branches-backdrop")
+                        .absolute()
+                        .top(TITLE_BAR_HEIGHT)
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .bg(hsla(0., 0., 0., 0.2))
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| this.hide_branches(window, cx)),
+                        ),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(TITLE_BAR_HEIGHT)
+                        .left(left)
+                        .w(width)
+                        .bottom(px(8.))
+                        .child(self.branches.clone()),
+                )
+            })
+            // "Create a branch" and "Merge into", in the middle, over a
+            // dimmed window.
+            .map(|root| {
+                // A message sizes itself; the others have a set height.
+                let dialog = match (&self.message_dialog, &self.new_branch_dialog, &self.merge_dialog) {
+                    (Some((dialog, _)), _, _) => Some((dialog.clone().into_any_element(), None)),
+                    (_, Some((dialog, _)), _) => Some((dialog.clone().into_any_element(), Some(px(320.)))),
+                    (_, _, Some((dialog, _))) => Some((dialog.clone().into_any_element(), Some(px(540.)))),
+                    _ => None,
+                };
+                let Some((dialog, height)) = dialog else {
+                    return root;
+                };
+                let height = height.map(|height| height.min(viewport.height - px(96.)));
+                root.child(
+                    div()
+                        .id("dialog-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .bg(hsla(0., 0., 0., 0.3))
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| this.close_dialogs(window, cx)),
+                        ),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(64.))
+                        .left_0()
+                        .right_0()
+                        .h_flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w(px(480.).min(viewport.width - px(32.)))
+                                .when_some(height, |frame, height| frame.h(height))
+                                .child(dialog),
+                        ),
+                )
+            })
             // The credentials, over a dimmed window. A click outside closes
             // them, and doesn't reach what's underneath.
             .when(self.credentials_visible, |root| {
@@ -2916,6 +3805,13 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(primary!("b"), ToggleSidebar, context),
         KeyBinding::new(primary!("alt-b"), ToggleNotes, context),
         KeyBinding::new(primary!("alt-k"), ToggleCredentials, context),
+        // As in GitHub Desktop, apart from the list of branches: its Ctrl+B
+        // shows the explorer here.
+        KeyBinding::new(primary!("shift-b"), ShowBranches, context),
+        KeyBinding::new(primary!("shift-n"), NewBranch, context),
+        KeyBinding::new(primary!("shift-m"), MergeIntoCurrentBranch, context),
+        KeyBinding::new(primary!("shift-p"), Pull, context),
+        KeyBinding::new(primary!("p"), Push, context),
         KeyBinding::new(primary!("shift-g"), ToggleChanges, context),
         KeyBinding::new(primary!("shift-e"), FocusExplorer, context),
         KeyBinding::new(primary!("s"), SaveFile, context),
@@ -2941,6 +3837,7 @@ fn bind_keys(cx: &mut App) {
     terminal::bind_keys(cx);
     terminal_panel::bind_keys(cx);
     credentials::bind_keys(cx);
+    branches::bind_keys(cx);
     explorer::bind_keys(cx);
     changes::bind_keys(cx);
 }

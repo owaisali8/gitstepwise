@@ -16,7 +16,7 @@ use similar::{Algorithm, DiffOp, capture_diff_slices_deadline};
 /// Give up on an exact diff after this long and accept a coarser one.
 const DIFF_DEADLINE: Duration = Duration::from_millis(500);
 
-fn git(dir: &Path) -> Command {
+pub(crate) fn git(dir: &Path) -> Command {
     let mut command = Command::new("git");
     command.arg("-C").arg(dir);
     #[cfg(windows)]
@@ -31,12 +31,12 @@ fn git(dir: &Path) -> Command {
 
 /// Run `git` and return what it printed, or `None` if it failed or isn't
 /// installed.
-fn run(command: &mut Command) -> Option<Vec<u8>> {
+pub(crate) fn run(command: &mut Command) -> Option<Vec<u8>> {
     let output = command.output().ok()?;
     output.status.success().then_some(output.stdout)
 }
 
-fn run_text(command: &mut Command) -> Option<String> {
+pub(crate) fn run_text(command: &mut Command) -> Option<String> {
     String::from_utf8(run(command)?).ok()
 }
 
@@ -69,10 +69,10 @@ impl Repo {
             .filter(|name| !name.is_empty())
     }
 
-    /// Changes when something is committed, checked out or staged, so the
-    /// committed versions of files need reading again.
+    /// Changes when something is committed, checked out, staged or
+    /// fetched, so the committed versions of files need reading again.
     pub fn stamp(&self) -> Vec<Option<SystemTime>> {
-        ["HEAD", "index", "logs/HEAD"]
+        ["HEAD", "index", "logs/HEAD", "FETCH_HEAD"]
             .iter()
             .map(|file| std::fs::metadata(self.git_dir.join(file)).and_then(|m| m.modified()).ok())
             .collect()
@@ -263,7 +263,7 @@ pub struct Commit {
 /// The website of a remote: `git@github.com:owner/repo.git`,
 /// `ssh://git@github.com/owner/repo` and `https://github.com/owner/repo.git`
 /// all give `https://github.com/owner/repo`.
-fn web_url(remote: &str) -> Option<String> {
+pub(crate) fn web_url(remote: &str) -> Option<String> {
     let rest = if let Some(rest) = remote.strip_prefix("https://").or_else(|| remote.strip_prefix("http://")) {
         rest.to_string()
     } else if let Some(rest) = remote.strip_prefix("ssh://") {
