@@ -16,6 +16,7 @@ mod file_icons;
 mod git;
 mod markdown;
 mod terminal;
+mod terminal_panel;
 mod timeline;
 
 use std::borrow::Cow;
@@ -33,6 +34,7 @@ use gpui_kit::component::input::{
 use gpui_kit::component::menu::AppMenuBar;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::text::{TextView, TextViewState};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -41,7 +43,7 @@ use changes::{ChangedFile, ChangesEvent, ChangesView, Mode, Select};
 use timeline::Timeline;
 use explorer::{Explorer, ExplorerEvent};
 use markdown::{EmbeddedImages, Links, Target};
-use terminal::{TerminalEvent, TerminalView};
+use terminal_panel::{SplitDown, SplitRight, TerminalPanel, TerminalPanelEvent};
 
 gpui_kit::actions!(
     text_editor,
@@ -116,6 +118,7 @@ gpui_kit::assets::icon_assets!(
         FolderPlus,
         GitBranch,
         Package,
+        Rows2,
         Scale,
     ]
 );
@@ -243,6 +246,8 @@ fn app_menus(checks: MenuChecks) -> Vec<Menu> {
             MenuItem::action("Edit Timeline", ShowTimeline),
             MenuItem::action("Commit History", ShowHistory),
             MenuItem::action("Terminal", ToggleTerminal).checked(checks.terminal),
+            MenuItem::action("Split Terminal Right", SplitRight),
+            MenuItem::action("Split Terminal Down", SplitDown),
             MenuItem::separator(),
             MenuItem::action("Word Wrap", ToggleSoftWrap).checked(checks.soft_wrap),
             MenuItem::action("Line Numbers", ToggleLineNumbers).checked(checks.line_numbers),
@@ -419,7 +424,8 @@ struct Workspace {
     explorer: Entity<Explorer>,
     sidebar_visible: bool,
     sidebar_width: Pixels,
-    terminal: Option<Entity<TerminalView>>,
+    /// The terminals, once one has been opened.
+    terminal: Option<Entity<TerminalPanel>>,
     terminal_visible: bool,
     terminal_height: Pixels,
     resizing: Option<Resize>,
@@ -1539,41 +1545,81 @@ impl Workspace {
 
     fn toggle_terminal(&mut self, _: &ToggleTerminal, window: &mut Window, cx: &mut Context<Self>) {
         if self.terminal_visible {
-            self.terminal_visible = false;
-            self.focus_active(window, cx);
-            cx.notify();
+            self.hide_terminal(window, cx);
             return;
         }
 
-        if self.terminal.is_none() {
-            // Start in the active file's folder, else the explorer's.
-            let working_directory = self
-                .active_document()
-                .and_then(|doc| doc.path.as_deref())
-                .and_then(Path::parent)
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| self.default_folder(cx));
-            if !self.start_terminal(working_directory, window, cx) {
-                return;
+        if self.terminal.is_none() && !self.start_terminal(self.terminal_folder(cx), window, cx) {
+            return;
+        }
+        self.show_terminal(window, cx);
+    }
+
+    fn hide_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.terminal_visible = false;
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// Where a new shell starts: the active file's folder, else the explorer's.
+    fn terminal_folder(&self, cx: &App) -> PathBuf {
+        self.active_document()
+            .and_then(|doc| doc.path.as_deref())
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.default_folder(cx))
+    }
+
+    /// Start a shell in `working_directory`, or say why it couldn't start.
+    fn start_shell(&mut self, working_directory: PathBuf, cx: &mut Context<Self>) -> Option<terminal::Shell> {
+        match terminal::start_shell(Some(working_directory)) {
+            Ok(shell) => Some(shell),
+            Err(err) => {
+                self.set_status(format!("Couldn't start a terminal: {err}"), true, cx);
+                None
+            }
+        }
+    }
+
+    /// Open the terminal panel with a shell in `working_directory`. Returns
+    /// whether it started.
+    fn start_terminal(&mut self, working_directory: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(shell) = self.start_shell(working_directory, cx) else {
+            return false;
+        };
+        let panel = cx.new(|cx| TerminalPanel::new(shell, window, cx));
+        self._terminal_subscription = Some(cx.subscribe_in(&panel, window, Self::on_terminal_event));
+        self.terminal = Some(panel);
+        true
+    }
+
+    /// Start another shell beside the active terminal: to its right on the
+    /// horizontal axis, below it on the vertical. With no terminal yet, open
+    /// the first one.
+    fn split_terminal(&mut self, axis: Axis, window: &mut Window, cx: &mut Context<Self>) {
+        let folder = self.terminal_folder(cx);
+        match self.terminal.clone() {
+            Some(panel) => {
+                let Some(shell) = self.start_shell(folder, cx) else {
+                    return;
+                };
+                panel.update(cx, |panel, cx| panel.split(axis, shell, window, cx));
+            }
+            None => {
+                if !self.start_terminal(folder, window, cx) {
+                    return;
+                }
             }
         }
         self.show_terminal(window, cx);
     }
 
-    /// Start a shell in `working_directory`. Returns whether it started.
-    fn start_terminal(&mut self, working_directory: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        match terminal::start_shell(Some(working_directory)) {
-            Ok(shell) => {
-                let view = cx.new(|cx| TerminalView::new(shell, cx));
-                self._terminal_subscription = Some(cx.subscribe_in(&view, window, Self::on_terminal_event));
-                self.terminal = Some(view);
-                true
-            }
-            Err(err) => {
-                self.set_status(format!("Couldn't start a terminal: {err}"), true, cx);
-                false
-            }
-        }
+    fn split_terminal_right(&mut self, _: &SplitRight, window: &mut Window, cx: &mut Context<Self>) {
+        self.split_terminal(Axis::Horizontal, window, cx);
+    }
+
+    fn split_terminal_down(&mut self, _: &SplitDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.split_terminal(Axis::Vertical, window, cx);
     }
 
     fn show_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1584,11 +1630,11 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Show the terminal in `dir`: a new shell there, or the running one
+    /// Show the terminal in `dir`: a new shell there, or the active one
     /// moved there.
     fn open_terminal_in(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         match &self.terminal {
-            Some(terminal) => terminal.update(cx, |terminal, cx| terminal.change_directory(&dir, cx)),
+            Some(terminal) => terminal.update(cx, |panel, cx| panel.change_directory(&dir, cx)),
             None => {
                 if !self.start_terminal(dir, window, cx) {
                     return;
@@ -1598,7 +1644,7 @@ impl Workspace {
         self.show_terminal(window, cx);
     }
 
-    /// End the shell and remove the panel.
+    /// End every shell and remove the panel.
     fn kill_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.terminal = None;
         self._terminal_subscription = None;
@@ -1609,14 +1655,15 @@ impl Workspace {
 
     fn on_terminal_event(
         &mut self,
-        _: &Entity<TerminalView>,
-        event: &TerminalEvent,
+        _: &Entity<TerminalPanel>,
+        event: &TerminalPanelEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
-            TerminalEvent::TitleChanged => cx.notify(),
-            TerminalEvent::Exited => self.kill_terminal(window, cx),
+            TerminalPanelEvent::Split(axis) => self.split_terminal(*axis, window, cx),
+            TerminalPanelEvent::Hide => self.hide_terminal(window, cx),
+            TerminalPanelEvent::Closed => self.kill_terminal(window, cx),
         }
     }
 
@@ -2068,9 +2115,9 @@ impl Workspace {
             )
     }
 
-    fn render_terminal_panel(&self, terminal: &Entity<TerminalView>, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The terminal panel, below a divider that sets its height.
+    fn render_terminal_panel(&self, terminal: &Entity<TerminalPanel>, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let title = terminal.read(cx).title().unwrap_or_else(|| "Shell".into());
 
         div()
             .v_flex()
@@ -2097,46 +2144,7 @@ impl Workspace {
                         }),
                     ),
             )
-            .child(
-                div()
-                    .h_flex()
-                    .items_center()
-                    .gap_2()
-                    .pl_3()
-                    .pr_1()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("TERMINAL"))
-                    .child(div().min_w_0().truncate().child(title))
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("hide-terminal")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::ChevronDown)
-                            .tooltip(format!("Hide terminal ({})", shortcut("`")))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_terminal(&ToggleTerminal, window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("kill-terminal")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Close)
-                            .tooltip("Close terminal (ends the shell)")
-                            .on_click(cx.listener(|this, _, window, cx| this.kill_terminal(window, cx))),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .pl_3()
-                    .pr_1()
-                    .pb_1()
-                    .child(terminal.clone()),
-            )
+            .child(div().flex_1().min_h_0().child(terminal.clone()))
     }
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2157,6 +2165,20 @@ impl Workspace {
                 "UTF-8".to_string(),
             ]
         });
+
+        // Shows or hides the terminal, and is lit while it shows. (A tooltip
+        // stays as it was built while the pointer rests, so it says both.)
+        let terminal_button = div()
+            .id("terminal-status")
+            .flex_none()
+            .cursor_pointer()
+            .when(self.terminal_visible, |button| button.text_color(theme.foreground))
+            .hover(|style| style.text_color(theme.foreground))
+            .child(Icon::new(LucideIcon::SquareTerminal).xsmall())
+            .tooltip(|window, cx| Tooltip::new("Show or hide the terminal (Ctrl+`)").build(window, cx))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.toggle_terminal(&ToggleTerminal, window, cx)
+            }));
 
         let (message, message_color) = match &self.status {
             Some(status) if status.is_error => (status.message.clone(), theme.danger),
@@ -2191,6 +2213,7 @@ impl Workspace {
                     .min_w_0()
                     .items_center()
                     .gap_4()
+                    .child(terminal_button)
                     // The branch, and how many files changed; click for the Changes view.
                     .when_some(self.branch.clone(), |row, branch| {
                         let changed = match self.changed_files {
@@ -2308,6 +2331,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::previous_tab))
             .on_action(cx.listener(Self::toggle_terminal))
+            .on_action(cx.listener(Self::split_terminal_right))
+            .on_action(cx.listener(Self::split_terminal_down))
             .on_action(cx.listener(Self::toggle_soft_wrap))
             .on_action(cx.listener(Self::toggle_line_numbers))
             .on_action(cx.listener(Self::toggle_preview))
@@ -2432,6 +2457,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(primary!("q"), Quit, context),
     ]);
     terminal::bind_keys(cx);
+    terminal_panel::bind_keys(cx);
     explorer::bind_keys(cx);
     changes::bind_keys(cx);
 }

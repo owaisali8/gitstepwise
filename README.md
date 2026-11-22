@@ -57,7 +57,11 @@ was made. Step through until you've seen everything, then commit.
 
 **The editor itself**
 
-- Tabs, the file explorer, and an integrated terminal.
+- Tabs, the file explorer, and an integrated terminal. The terminal icon at the
+  left of the status bar shows or hides it.
+- Split the terminal side by side or one above the other, as many times as you
+  like, and drag the dividers to resize. Use the buttons in the terminal's
+  header, View → Split Terminal Right or Down, or the keys below.
 - Syntax highlighting for Rust, TOML, Markdown, Python, JavaScript, TypeScript,
   HTML, CSS, JSON, YAML and shell scripts.
 - A **Markdown preview** (View → Markdown Preview, or the eye button at the
@@ -99,7 +103,8 @@ A path that doesn't exist yet opens as a new, empty file at that path.
 
 Gitstepwise is developed and tested on Windows. GPUI also runs on macOS and Linux,
 and the code handles both (Cmd shortcuts on macOS, your `$SHELL` in the terminal).
-It builds and its tests pass on Linux, but the app hasn't been tried on either yet.
+On Linux it builds, its tests pass and it has been run briefly under X11. It hasn't
+been tried on macOS yet.
 
 ## Reviewing an agent's changes
 
@@ -156,6 +161,14 @@ opens. These act on the selected file or folder:
 
 In the **History** view, N and P go to older and newer commits.
 
+In the **terminal** (as in Windows Terminal):
+
+| Action | Shortcut |
+| --- | --- |
+| Split right / split down | Alt+Shift+= / Alt+Shift+- |
+| Move to the terminal on the left, right, above or below | Alt+arrow keys |
+| Close this terminal (ends its shell) | Ctrl+Shift+W |
+
 ## How the timeline is stored
 
 The timeline is kept in `.git/gitstepwise/timeline.json` inside your repository, so
@@ -181,6 +194,7 @@ starts again from the new commit.
 | `src/file_icons.rs` | The explorer's icon and color for each kind of file |
 | `src/markdown.rs` | Where the Markdown preview's links and images lead |
 | `src/terminal.rs` | The integrated terminal |
+| `src/terminal_panel.rs` | The terminal panel: split terminals and their header |
 | `assets/` | The logo, the app icon, and `make-icon.ps1`, which rebuilds the icon |
 
 ## Development
