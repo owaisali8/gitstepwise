@@ -221,6 +221,9 @@ impl Updater {
             }
             self.state = UpdateState::Available(release);
         } else if asked {
+            // Available while the offer shows, so a scheduled check doesn't
+            // install it before the user answers.
+            self.state = UpdateState::Available(release.clone());
             cx.emit(UpdaterEvent::Found(release));
         } else if known.as_ref() == Some(&release.version) {
             self.state = UpdateState::Available(release);
@@ -241,9 +244,10 @@ impl Updater {
         }
     }
 
-    /// The user said not now: keep the version showing as available.
+    /// The user said not now: keep the version showing as available, and
+    /// don't install it on a schedule.
     pub fn postpone(&mut self, release: Release, cx: &mut Context<Self>) {
-        if matches!(self.state, UpdateState::Idle) {
+        if matches!(self.state, UpdateState::Idle | UpdateState::Available(_)) {
             self.state = UpdateState::Available(release);
             cx.notify();
         }
