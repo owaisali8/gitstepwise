@@ -553,6 +553,9 @@ mod tests {
         sh(&dir, &["config", "user.name", "Test"]);
         sh(&dir, &["config", "user.email", "test@example.com"]);
         sh(&dir, &["config", "commit.gpgsign", "false"]);
+        // Git for Windows turns line endings into CRLF when it writes files
+        // back (a stash, an aborted merge); the tests compare exact text.
+        sh(&dir, &["config", "core.autocrlf", "false"]);
         commit(&dir, "a.txt", "one\n", "First");
         let repo = Repo::find(&dir).unwrap();
         (dir, repo)
@@ -651,6 +654,7 @@ mod tests {
         sh(&mine, &["config", "user.name", "Test"]);
         sh(&mine, &["config", "user.email", "test@example.com"]);
         sh(&mine, &["config", "commit.gpgsign", "false"]);
+        sh(&mine, &["config", "core.autocrlf", "false"]);
         let theirs = folder("remote-theirs");
         sh(&theirs, &["clone", "-q", bare.to_str().unwrap(), "."]);
         let repo = Repo::find(&mine).unwrap();
