@@ -37,6 +37,9 @@ gpui_kit::actions!(
         /// interrupts the running program.
         CopyOrInterrupt,
         CopySelection,
+        /// Ctrl+Shift+V. Bound here because the window binds it to the
+        /// Markdown preview, and bindings run before the key handler.
+        PasteClipboard,
     ]
 );
 
@@ -51,6 +54,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-c", CopySelection, context),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-shift-c", CopySelection, context),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-v", PasteClipboard, context),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-v", PasteClipboard, context),
     ]);
 }
 
@@ -485,6 +492,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::send_back_tab))
             .on_action(cx.listener(Self::copy_or_interrupt))
             .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(|this, _: &PasteClipboard, _, cx| this.paste(cx)))
             // Edit › Copy and Edit › Paste from the menu bar.
             .on_action(cx.listener(|this, _: &input::Copy, _, cx| {
                 this.copy_selection(cx);
