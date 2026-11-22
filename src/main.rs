@@ -14,6 +14,7 @@ mod changes;
 mod explorer;
 mod file_icons;
 mod git;
+mod markdown;
 mod terminal;
 mod timeline;
 
@@ -31,6 +32,7 @@ use gpui_kit::component::input::{
 };
 use gpui_kit::component::menu::AppMenuBar;
 use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -38,6 +40,7 @@ use gpui_kit::*;
 use changes::{ChangedFile, ChangesEvent, ChangesView, Mode, Select};
 use timeline::Timeline;
 use explorer::{Explorer, ExplorerEvent};
+use markdown::{EmbeddedImages, Links, Target};
 use terminal::{TerminalEvent, TerminalView};
 
 gpui_kit::actions!(
@@ -60,6 +63,8 @@ gpui_kit::actions!(
         ToggleTerminal,
         ToggleSoftWrap,
         ToggleLineNumbers,
+        TogglePreview,
+        TogglePreviewToSide,
         ZoomIn,
         ZoomOut,
         ResetZoom,
@@ -68,6 +73,12 @@ gpui_kit::actions!(
         Quit,
     ]
 );
+
+/// A link in a Markdown preview was clicked: open the file or folder it
+/// leads to.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = text_editor, no_json)]
+struct OpenLinkedPath(PathBuf);
 
 const APP_NAME: &str = "Gitstepwise";
 const KEY_CONTEXT: &str = "TextEditor";
@@ -89,6 +100,7 @@ gpui_kit::assets::icon_assets!(
     [
         BookOpen,
         Circle,
+        Columns2,
         Database,
         FileArchive,
         FileBraces,
@@ -155,6 +167,10 @@ fn language_for(path: &Path) -> &'static str {
         .map_or(PLAIN_TEXT, |(_, id, _)| id)
 }
 
+fn is_markdown(path: &Path) -> bool {
+    language_for(path) == "markdown"
+}
+
 fn language_label(id: &str) -> &'static str {
     LANGUAGES
         .iter()
@@ -184,6 +200,9 @@ struct MenuChecks {
     terminal: bool,
     soft_wrap: bool,
     line_numbers: bool,
+    /// The active tab is a Markdown file, and how it shows.
+    markdown: bool,
+    preview: Preview,
     dark: bool,
 }
 
@@ -228,6 +247,13 @@ fn app_menus(checks: MenuChecks) -> Vec<Menu> {
             MenuItem::action("Word Wrap", ToggleSoftWrap).checked(checks.soft_wrap),
             MenuItem::action("Line Numbers", ToggleLineNumbers).checked(checks.line_numbers),
             MenuItem::separator(),
+            MenuItem::action("Markdown Preview", TogglePreview)
+                .checked(checks.preview == Preview::Full)
+                .disabled(!checks.markdown),
+            MenuItem::action("Markdown Preview to the Side", TogglePreviewToSide)
+                .checked(checks.preview == Preview::Side)
+                .disabled(!checks.markdown),
+            MenuItem::separator(),
             MenuItem::action("Zoom In", ZoomIn),
             MenuItem::action("Zoom Out", ZoomOut),
             MenuItem::action("Reset Zoom", ResetZoom),
@@ -244,6 +270,23 @@ type Continuation = Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Wor
 /// Identifies a document across tab moves and closes.
 type DocId = usize;
 
+/// How a Markdown file shows: as its source, as the rendered page, or both.
+#[derive(Clone, Copy, PartialEq, Default)]
+enum Preview {
+    #[default]
+    Off,
+    /// The rendered page in place of the source.
+    Full,
+    /// The source on the left and the rendered page on the right.
+    Side,
+}
+
+/// A Markdown file rendered, kept up to date with its tab's text.
+struct Rendered {
+    state: Entity<TextViewState>,
+    images: EmbeddedImages,
+}
+
 /// One open file (or untitled buffer) and its tab.
 struct Document {
     id: DocId,
@@ -258,6 +301,10 @@ struct Document {
     markers: Vec<git::Marker>,
     /// The gutter strip and scrollbar marks, created once the file has a base.
     decorations: Option<(GutterDecorationCollection, OverviewRulerDecorationCollection)>,
+    /// How a Markdown file shows; always `Off` for other files.
+    preview: Preview,
+    /// The rendered page, while `preview` shows it.
+    rendered: Option<Rendered>,
     _base_task: Option<Task<()>>,
     _marker_task: Option<Task<()>>,
     _subscriptions: [Subscription; 2],
@@ -269,6 +316,18 @@ impl Document {
             .as_deref()
             .and_then(Path::file_name)
             .map_or_else(|| "Untitled".into(), |name| name.to_string_lossy().into_owned())
+    }
+
+    fn is_markdown(&self) -> bool {
+        self.path.as_deref().is_some_and(is_markdown)
+    }
+
+    /// Hand the editor's text to the rendered page, if there is one.
+    fn update_rendered(&self, cx: &mut App) {
+        if let Some(rendered) = &self.rendered {
+            let text = self.editor.read(cx).value();
+            rendered.state.update(cx, |state, cx| state.set_text(&text, cx));
+        }
     }
 
     /// An untitled tab nobody has typed into, which opening a file reuses.
@@ -509,6 +568,16 @@ impl Workspace {
                     .update(cx, |view, cx| view.show_history(relative, cx));
                 self.show_changes(None, window, cx);
             }
+            ExplorerEvent::OpenPreview(path) => {
+                self.open_path(path.clone(), window, cx);
+                let opened = self
+                    .active_document()
+                    .and_then(|doc| doc.path.as_deref())
+                    .is_some_and(|open| same_file(open, path));
+                if opened {
+                    self.set_preview(Preview::Full, false, window, cx);
+                }
+            }
             ExplorerEvent::Permalink { path, open } => self.permalink(path, *open, cx),
             ExplorerEvent::Status { message, is_error } => self.set_status(message.clone(), *is_error, cx),
             ExplorerEvent::GitChanged => self.refresh_git(cx),
@@ -536,6 +605,10 @@ impl Workspace {
                 doc.editor.update(cx, |state, cx| state.set_highlighter(language, cx));
             }
             doc.path = Some(new_path);
+            if !doc.is_markdown() {
+                doc.preview = Preview::Off;
+                doc.rendered = None;
+            }
             moved.push(doc.id);
         }
         for id in moved {
@@ -697,6 +770,8 @@ impl Workspace {
             base: None,
             markers: Vec::new(),
             decorations: None,
+            preview: Preview::Off,
+            rendered: None,
             _base_task: None,
             _marker_task: None,
             _subscriptions: subscriptions,
@@ -776,6 +851,8 @@ impl Workspace {
             return;
         }
         match self.active_document() {
+            // The page alone shows: the source can't be typed into unseen.
+            Some(doc) if doc.preview == Preview::Full => self.focus_handle.focus(window, cx),
             Some(doc) => {
                 let editor = doc.editor.clone();
                 editor.update(cx, |state, cx| state.focus(window, cx));
@@ -880,6 +957,7 @@ impl Workspace {
         }
         let id = self.documents[ix].id;
         self.schedule_markers(id, MARKER_DELAY, cx);
+        self.documents[ix].update_rendered(cx);
         cx.notify();
     }
 
@@ -916,12 +994,15 @@ impl Workspace {
 
     /// Reinstall the menus when one of their check marks would change.
     fn sync_menus(&mut self, cx: &mut Context<Self>) {
+        let doc = self.active_document().filter(|_| !self.changes_active);
         let checks = MenuChecks {
             sidebar: self.sidebar_visible,
             changes: self.changes_open,
             terminal: self.terminal_visible,
             soft_wrap: self.soft_wrap,
             line_numbers: self.line_numbers,
+            markdown: doc.is_some_and(Document::is_markdown),
+            preview: doc.map_or(Preview::Off, |doc| doc.preview),
             dark: cx.theme().is_dark(),
         };
         if self.menu_checks == Some(checks) {
@@ -970,6 +1051,12 @@ impl Workspace {
         let doc = &mut self.documents[ix];
         doc.path = Some(path);
         doc.dirty = false;
+        // Saved as something other than Markdown: there's no page to show.
+        if !doc.is_markdown() && doc.preview != Preview::Off {
+            doc.preview = Preview::Off;
+            doc.rendered = None;
+            self.focus_active(window, cx);
+        }
         self.update_title(window);
         self.set_status(message, false, cx);
         // A "Save As" may have created a file the explorer should list.
@@ -1635,6 +1722,64 @@ impl Workspace {
         cx.notify();
     }
 
+    // ---- Markdown preview --------------------------------------------------
+
+    /// Show the active Markdown file as `preview`. With `toggle`, a file
+    /// already showing that way goes back to its source.
+    fn set_preview(&mut self, preview: Preview, toggle: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.changes_active {
+            return;
+        }
+        let Some(doc) = self.documents.get_mut(self.active) else {
+            return;
+        };
+        if !doc.is_markdown() {
+            self.set_status("Only Markdown files have a preview.", false, cx);
+            return;
+        }
+        doc.preview = if toggle && doc.preview == preview {
+            Preview::Off
+        } else {
+            preview
+        };
+        if doc.preview == Preview::Off {
+            doc.rendered = None;
+        } else if doc.rendered.is_none() {
+            let text = doc.editor.read(cx).value();
+            doc.rendered = Some(Rendered {
+                state: cx.new(|cx| TextViewState::markdown(&text, cx)),
+                images: EmbeddedImages::default(),
+            });
+        }
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    fn toggle_preview(&mut self, _: &TogglePreview, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_preview(Preview::Full, true, window, cx);
+    }
+
+    fn toggle_preview_to_side(&mut self, _: &TogglePreviewToSide, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_preview(Preview::Side, true, window, cx);
+    }
+
+    fn open_linked_path(&mut self, link: &OpenLinkedPath, window: &mut Window, cx: &mut Context<Self>) {
+        let path = &link.0;
+        if path.exists() {
+            self.open_path(path.clone(), window, cx);
+        } else {
+            self.set_status(format!("The link leads to {}, which doesn't exist.", path.display()), true, cx);
+        }
+    }
+
+    /// Where a Markdown file's links starting with `/` lead: the repository,
+    /// or else the explorer's folder.
+    fn links_root(&self, cx: &App) -> PathBuf {
+        self.repo
+            .as_ref()
+            .map_or_else(|| self.default_folder(cx), |repo| repo.root.clone())
+    }
+
     /// The editor's font size: the zoomed one, else the theme's code size.
     fn editor_font_size(&self, cx: &App) -> Pixels {
         self.font_size.unwrap_or(cx.theme().mono_font_size)
@@ -1758,7 +1903,43 @@ impl Workspace {
                 )
         });
 
+        // For a Markdown file, buttons that show it rendered.
+        let preview_buttons = self
+            .active_document()
+            .filter(|doc| !self.changes_active && doc.is_markdown())
+            .map(|doc| {
+                div()
+                    .h_flex()
+                    .h_full()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .child(
+                        Button::new("toggle-preview")
+                            .ghost()
+                            .xsmall()
+                            .icon(LucideIcon::Eye)
+                            .selected(doc.preview == Preview::Full)
+                            .tooltip(format!("Preview ({})", shortcut("Shift+V")))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_preview(&TogglePreview, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("toggle-preview-to-side")
+                            .ghost()
+                            .xsmall()
+                            .icon(LucideIcon::Columns2)
+                            .selected(doc.preview == Preview::Side)
+                            .tooltip(format!("Preview to the side ({}, then V)", shortcut("K")))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_preview_to_side(&TogglePreviewToSide, window, cx)
+                            })),
+                    )
+            });
+
         TabBar::new("documents")
+            .when_some(preview_buttons, |bar, buttons| bar.suffix(buttons))
             .selected_index(self.active_tab_index())
             .on_click(cx.listener(|this, ix: &usize, window, cx| this.select_tab(*ix, window, cx)))
             .children(self.documents.iter().map(|doc| {
@@ -1781,6 +1962,63 @@ impl Workspace {
                 )
             }))
             .children(changes_tab)
+    }
+
+    /// The active file: its editor, its rendered Markdown, or both side by side.
+    fn render_document(&self, doc: &Document, cx: &mut Context<Self>) -> AnyElement {
+        let editor = Editor::new(&doc.editor)
+            .bordered(false)
+            .text_size(self.editor_font_size(cx))
+            .size_full();
+        let area = div().flex_1().min_h_0();
+        match (&doc.rendered, doc.preview) {
+            (Some(rendered), Preview::Full) => area
+                // Holds focus in place of the hidden editor.
+                .track_focus(&self.focus_handle)
+                .child(self.render_preview(doc, rendered, cx))
+                .into_any_element(),
+            (Some(rendered), Preview::Side) => {
+                let border = cx.theme().border;
+                area.h_flex()
+                    .child(div().flex_1().min_w_0().h_full().child(editor))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .border_l_1()
+                            .border_color(border)
+                            .child(self.render_preview(doc, rendered, cx)),
+                    )
+                    .into_any_element()
+            }
+            _ => area.child(editor).into_any_element(),
+        }
+    }
+
+    /// A Markdown file as a page. It zooms with the editor, and its links and
+    /// images lead to files next to it.
+    fn render_preview(&self, doc: &Document, rendered: &Rendered, cx: &mut Context<Self>) -> impl IntoElement {
+        let (font_size, mono_font_size) = (cx.theme().font_size, cx.theme().mono_font_size);
+        let zoom = f32::from(self.editor_font_size(cx)) / f32::from(mono_font_size);
+        let file = doc.path.clone().unwrap_or_default();
+        let links = Links::new(&file, &self.links_root(cx), rendered.images.clone());
+        let image_links = links.clone();
+
+        div().size_full().text_size(font_size * zoom).child(
+            TextView::new(&rendered.state)
+                .scrollable(true)
+                .selectable(true)
+                .size_full()
+                .px_8()
+                .py_3()
+                .image_source(move |uri| image_links.image(uri))
+                .on_link_click(move |url, _, window, cx| match links.target(url) {
+                    Target::Url => cx.open_url(url),
+                    Target::Path(path) => window.dispatch_action(Box::new(OpenLinkedPath(path)), cx),
+                    Target::Anchor => {}
+                }),
+        )
     }
 
     /// What the main area shows once every tab is closed. It holds focus, so
@@ -1909,7 +2147,11 @@ impl Workspace {
             let state = doc.editor.read(cx);
             let line_count = state.text().lines_len();
             [
-                format!("Ln {}, Col {}", doc.cursor.0 + 1, doc.cursor.1 + 1),
+                if doc.preview == Preview::Full {
+                    "Preview".to_string()
+                } else {
+                    format!("Ln {}, Col {}", doc.cursor.0 + 1, doc.cursor.1 + 1)
+                },
                 format!("{line_count} {}", if line_count == 1 { "line" } else { "lines" }),
                 language_label(&state.language_name()).to_string(),
                 "UTF-8".to_string(),
@@ -2068,6 +2310,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::toggle_soft_wrap))
             .on_action(cx.listener(Self::toggle_line_numbers))
+            .on_action(cx.listener(Self::toggle_preview))
+            .on_action(cx.listener(Self::toggle_preview_to_side))
+            .on_action(cx.listener(Self::open_linked_path))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::reset_zoom))
@@ -2131,14 +2376,7 @@ impl Render for Workspace {
                                 let Some(doc) = self.active_document() else {
                                     return column.child(self.render_empty_state(cx));
                                 };
-                                column.child(
-                                    div().flex_1().min_h_0().child(
-                                        Editor::new(&doc.editor)
-                                            .bordered(false)
-                                            .text_size(self.editor_font_size(cx))
-                                            .size_full(),
-                                    ),
-                                )
+                                column.child(self.render_document(doc, cx))
                             })
                             .when_some(terminal, |this, terminal| {
                                 this.child(self.render_terminal_panel(&terminal, cx))
@@ -2182,6 +2420,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(primary!("pageup"), PreviousTab, context),
         KeyBinding::new("ctrl-`", ToggleTerminal, context),
         KeyBinding::new("alt-z", ToggleSoftWrap, context),
+        KeyBinding::new(primary!("shift-v"), TogglePreview, context),
+        KeyBinding::new(concat!(primary!("k"), " v"), TogglePreviewToSide, context),
         // Ctrl+= and Ctrl++ (with or without Shift, on the main row's = key).
         // The menu shows the last binding, so plain Ctrl+= comes last.
         KeyBinding::new(primary!("+"), ZoomIn, context),

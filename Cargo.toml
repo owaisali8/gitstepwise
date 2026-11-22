@@ -29,6 +29,8 @@ gpui-kit = { version = "0.10", features = [
     "tree-sitter-yaml",
 ] }
 trash = "5"
+# Images embedded in Markdown as data: URLs, for the preview.
+data-url = "0.3"
 
 [build-dependencies]
 # Embeds assets/icon.ico in the Windows .exe (see build.rs).

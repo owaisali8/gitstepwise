@@ -51,8 +51,8 @@ was made. Step through until you've seen everything, then commit.
 - Icons for each kind of file, in their own colors.
 - Right-click a file or folder for New File and New Folder, Rename, Duplicate,
   Cut, Copy and Paste, Move to Recycle Bin (or Trash) and Delete, Reveal in File
-  Explorer, Open in Default App, Open in Terminal, Copy Path and Copy Relative
-  Path, Add to `.gitignore` or `.git/info/exclude`, View History, and Open or
+  Explorer, Open in Default App, Open Preview (for Markdown files), Open in
+  Terminal, Copy Path and Copy Relative Path, Add to `.gitignore` or `.git/info/exclude`, View History, and Open or
   Copy File Permalink (for GitHub and GitLab remotes).
 
 **The editor itself**
@@ -60,6 +60,10 @@ was made. Step through until you've seen everything, then commit.
 - Tabs, the file explorer, and an integrated terminal.
 - Syntax highlighting for Rust, TOML, Markdown, Python, JavaScript, TypeScript,
   HTML, CSS, JSON, YAML and shell scripts.
+- A **Markdown preview** (View → Markdown Preview, or the eye button at the
+  right of the tabs): the file rendered, in place of its source or beside it,
+  updating as you type. Links to other files open them in a tab, and images
+  stored with the file are shown (images on the web aren't yet).
 - Word wrap, line numbers, zoom, and light and dark themes.
 - Its own title bar with File, Edit and View menus.
 
@@ -122,6 +126,7 @@ On macOS, use Cmd in place of Ctrl.
 | Open or close Changes | Ctrl+Shift+G |
 | Show or hide the terminal | Ctrl+\` |
 | Word wrap | Alt+Z |
+| Markdown preview / preview to the side | Ctrl+Shift+V / Ctrl+K, then V |
 | Zoom in / out / reset | Ctrl+= / Ctrl+- / Ctrl+0 |
 | Quit | Ctrl+Q |
 
@@ -171,6 +176,7 @@ starts again from the new commit.
 | `src/timeline.rs` | The file watcher and the edit timeline |
 | `src/git.rs` | Reading the repository through the `git` command, and line diffs |
 | `src/explorer.rs` | The file explorer |
+| `src/markdown.rs` | Where the Markdown preview's links and images lead |
 | `src/terminal.rs` | The integrated terminal |
 | `assets/` | The logo, the app icon, and `make-icon.ps1`, which rebuilds the icon |
 

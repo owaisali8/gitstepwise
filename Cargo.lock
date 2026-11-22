@@ -1946,6 +1946,7 @@ name = "gitstepwise"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
+ "data-url",
  "embed-resource",
  "futures",
  "gpui-kit",

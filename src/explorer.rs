@@ -43,6 +43,7 @@ gpui_kit::actions!(
         NewFolderHere,
         RevealInFileManager,
         OpenWithSystem,
+        OpenPreview,
         OpenInTerminal,
         CutEntry,
         CopyEntry,
@@ -110,6 +111,8 @@ pub enum ExplorerEvent {
     Renamed { from: PathBuf, to: PathBuf },
     /// A file or folder was trashed or deleted.
     Removed(PathBuf),
+    /// Open this Markdown file rendered.
+    OpenPreview(PathBuf),
     /// Show the terminal in this folder.
     OpenTerminal(PathBuf),
     /// Show the commits that changed this file or folder.
@@ -133,6 +136,7 @@ struct MenuTarget {
     /// The explorer's folder itself (the empty space was clicked).
     is_root: bool,
     is_dir: bool,
+    is_markdown: bool,
     can_paste: bool,
     in_repo: bool,
 }
@@ -486,6 +490,7 @@ impl Explorer {
         MenuTarget {
             is_root: target.is_none(),
             is_dir: target.as_deref().is_none_or(Path::is_dir),
+            is_markdown: target.as_deref().is_some_and(|path| !path.is_dir() && crate::is_markdown(path)),
             can_paste: self.clipboard.is_some(),
             in_repo: self.repo.is_some(),
         }
@@ -703,6 +708,15 @@ impl Explorer {
             }
             Ok(false) => self.status(format!("{pattern} is already in {file_name}."), false, cx),
             Err(err) => self.status(format!("Couldn't change {file_name}: {err}"), true, cx),
+        }
+    }
+
+    fn open_preview(&mut self, _: &OpenPreview, _: &mut Window, cx: &mut Context<Self>) {
+        if self.naming() {
+            return;
+        }
+        if let Some(path) = self.target().filter(|path| !path.is_dir() && crate::is_markdown(path)) {
+            cx.emit(ExplorerEvent::OpenPreview(path));
         }
     }
 
@@ -1126,6 +1140,7 @@ impl Render for Explorer {
             .on_action(cx.listener(Self::add_to_gitignore))
             .on_action(cx.listener(Self::add_to_git_exclude))
             .on_action(cx.listener(Self::view_history))
+            .on_action(cx.listener(Self::open_preview))
             .on_action(cx.listener(Self::open_permalink))
             .on_action(cx.listener(Self::copy_permalink))
             .on_action(cx.listener(Self::rename_entry))
@@ -1258,12 +1273,18 @@ const TRASH_NAME: &str = if cfg!(target_os = "windows") { "Recycle Bin" } else {
 fn build_menu(menu: PopupMenu, target: &MenuTarget) -> PopupMenu {
     let is_file = !target.is_root && !target.is_dir;
     let no_git = !target.in_repo;
-    menu.menu("New File", Box::new(NewFileHere))
+    let menu = menu
+        .menu("New File", Box::new(NewFileHere))
         .menu("New Folder", Box::new(NewFolderHere))
         .separator()
         .menu(REVEAL_LABEL, Box::new(RevealInFileManager))
-        .menu_with_disabled("Open in Default App", Box::new(OpenWithSystem), !is_file)
-        .menu("Open in Terminal", Box::new(OpenInTerminal))
+        .menu_with_disabled("Open in Default App", Box::new(OpenWithSystem), !is_file);
+    let menu = if target.is_markdown {
+        menu.menu("Open Preview", Box::new(OpenPreview))
+    } else {
+        menu
+    };
+    menu.menu("Open in Terminal", Box::new(OpenInTerminal))
         .separator()
         .menu_with_disabled("Cut", Box::new(CutEntry), target.is_root)
         .menu_with_disabled("Copy", Box::new(CopyEntry), target.is_root)
