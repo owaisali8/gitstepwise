@@ -21,7 +21,7 @@ CI (`.github/workflows/ci.yml`, windows-latest) runs `cargo build --locked --all
 - On Linux, GPUI links against xcb, freetype and xkbcommon. Without their development packages the build compiles but fails at linking (`unable to find library -lxkbcommon`). On Debian and Ubuntu, install `libxcb1-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev`.
 - `GITSTEPWISE_FPS=1` shows the frame rate in the status bar.
 - Release builds use `windows_subsystem = "windows"`, so there is no console and `eprintln!` output isn't visible. On Windows, a running `target\release\gitstepwise.exe` can't be overwritten by a rebuild; close it first.
-- `release.yml` builds and publishes a release when a `v*` tag is pushed; the tag must match the version in `Cargo.toml`.
+- `release.yml` builds and publishes a release when a `v*` tag is pushed; the tag must match the version in `Cargo.toml`. Installed copies update themselves to it (see Updates below), so a release reaches users within hours. Keep the file name `gitstepwise-<tag>-windows-x64.exe`: `updater.rs` finds the file by that ending.
 - `build.rs` embeds `assets/icon.ico` on Windows. Rebuild the icon from the SVGs with `powershell -ExecutionPolicy Bypass -File assets\make-icon.ps1`.
 - `examples/hello.rs` is a standalone GPUI Kit sample, not part of the app.
 
@@ -104,6 +104,12 @@ It's one binary crate. `src/main.rs` holds `Workspace`, the root view, which own
 - `MessageDialog` stands in for `window.prompt` for branch questions and Git's errors: GPUI's fallback prompt on Linux doesn't wrap text. `Workspace::ask` shows one and calls back with the button pressed.
 - The views only emit events; `Workspace` runs every operation through `run_git` (one at a time, in the background, with `git_busy` shown on the fetch button), after `confirm_close_all` where files change. `after_git` then reloads tabs without unsaved changes from disk (`reload_clean_documents`; a tab whose file is gone closes), and refreshes the explorer, the gutter, the Changes view, the timeline (a new HEAD starts it afresh) and the list.
 - The title bar's "Current branch" button records where it's drawn (a `canvas` into `branch_button`), so the list opens under it. `Repo::stamp` includes `FETCH_HEAD`, so a fetch made elsewhere updates the fetch button.
+
+**Updates (`updater.rs`):**
+- `Updater` is an entity owned by `Workspace`. It asks GitHub's API for the latest release of the repository named by `repository` in `Cargo.toml`, with `ureq`, in `cx.background_spawn`. Versions are compared with `semver` against `CARGO_PKG_VERSION`.
+- Release builds check 10 s after starting and every 6 hours, and install what they find, unless Help → Update Automatically is off (kept in `updates.json` in the config folder). Debug builds check only when asked and never install. A check the user asked for asks before installing (`UpdaterEvent::Found`).
+- Installing downloads the file to `<exe>.new` and checks its size, its SHA-256 against the `digest` GitHub lists, and the `MZ` header. Then it renames the running exe to `<exe>.old` and moves the new one into its place: Windows can rename a running program but not overwrite it. `clean_up` removes the `.old` file on the next start.
+- Restart to Update runs `confirm_close_all`, records the exe with `relaunch_after_quit`, and quits. `main` calls `relaunch_if_asked` after GPUI's run loop returns, so every `on_app_quit` hook has saved by then. Started with no arguments, the new copy reopens the last project.
 
 **Markdown preview:**
 - Each `Document` has a `Preview` mode and a `TextViewState`, updated from `InputEvent::Change`.

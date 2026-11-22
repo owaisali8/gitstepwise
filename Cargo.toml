@@ -2,6 +2,8 @@
 name = "gitstepwise"
 version = "0.1.0"
 edition = "2024"
+# Where updates come from: the releases of this repository on GitHub.
+repository = "https://github.com/owaisali8/gitstepwise"
 
 [dependencies]
 # Terminal emulation and the PTY (ConPTY on Windows) for the terminal panel.
@@ -40,6 +42,11 @@ argon2 = "0.5"
 chacha20poly1305 = "0.10"
 zeroize = "1"
 base64 = "0.22"
+# Updates: asks GitHub for the latest release, downloads it, and checks it
+# against the SHA-256 digest GitHub lists for it.
+ureq = { version = "3", features = ["json"] }
+semver = "1"
+sha2 = "0.10"
 
 [build-dependencies]
 # Embeds assets/icon.ico in the Windows .exe (see build.rs).

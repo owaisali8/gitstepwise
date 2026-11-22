@@ -128,11 +128,33 @@ was made. Step through until you've seen everything, then commit.
   updating as you type. Links to other files open them in a tab, and images
   stored with the file are shown (images on the web aren't yet).
 - Word wrap, line numbers, zoom, and light and dark themes.
-- Its own title bar with File, Edit and View menus.
+- Its own title bar with File, Edit, Branch, View and Help menus.
+
+**Updates**
+
+- The Windows app keeps itself up to date. A few seconds after it starts, and
+  every six hours after that, it looks for a newer release on GitHub. If there
+  is one, it downloads it in the background and checks it against the size and
+  SHA-256 digest GitHub lists for it.
+- **Restart to update** then shows in the status bar. Click it, or choose Help →
+  Restart to Update, to start the new version; it asks about unsaved changes
+  first. Otherwise the new version runs from the next start.
+- **Help → Check for Updates…** looks straight away, and asks before installing.
+- Turn off **Help → Update Automatically** to only check when you ask. The
+  setting is kept in `updates.json` in the app's config folder.
+- Copies built with `cargo build` (debug builds) never replace themselves. They
+  only say when there's a newer release.
 
 ## Getting started
 
-You need:
+On Windows, the quickest way is to download the latest
+`gitstepwise-vX.Y.Z-windows-x64.exe` from the
+[Releases page](https://github.com/owaisali8/gitstepwise/releases) and run it. It
+needs [Git](https://git-scm.com/) on your `PATH`, and updates itself from then on.
+Put it in a folder you can write to (not `Program Files`), so it can replace
+itself.
+
+To build it yourself, you need:
 
 - A recent stable [Rust toolchain](https://rustup.rs/) (Gitstepwise uses the 2024
   edition).
@@ -273,6 +295,7 @@ starts again from the new commit.
 | `src/projects.rs` | The list of projects and the picker to switch between them |
 | `src/terminal.rs` | The integrated terminal |
 | `src/terminal_panel.rs` | The terminal panel: split terminals and their header |
+| `src/updater.rs` | Checking GitHub for a newer release, and installing it |
 | `assets/` | The logo, the app icon, and `make-icon.ps1`, which rebuilds the icon |
 
 ## Development
@@ -283,6 +306,10 @@ cargo build    # debug build
 ```
 
 - Set `GITSTEPWISE_FPS=1` to show the frame rate in the status bar.
+- To publish a release, set the new `version` in `Cargo.toml`, commit, then tag
+  and push the tag: `git tag v0.2.0` and `git push origin v0.2.0`. The Release
+  workflow builds the Windows app and publishes it, and the apps already out
+  there update to it. The tag must match the version in `Cargo.toml`.
 - After editing `assets/logo.svg` or `assets/logo-small.svg`, rebuild the Windows
   icon with `powershell -ExecutionPolicy Bypass -File assets\make-icon.ps1` (it uses
   Microsoft Edge to render the SVGs).

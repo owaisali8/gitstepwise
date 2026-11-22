@@ -23,6 +23,7 @@ mod projects;
 mod terminal;
 mod terminal_panel;
 mod timeline;
+mod updater;
 mod vault;
 
 use std::borrow::Cow;
@@ -62,6 +63,7 @@ use markdown::{EmbeddedImages, Links, Target};
 use notes::{NotesEvent, NotesPanel};
 use projects::{ProjectPicker, ProjectPickerEvent, Projects};
 use terminal_panel::{SplitDown, SplitRight, TerminalPanel, TerminalPanelEvent};
+use updater::{Release, UpdateState, Updater, UpdaterEvent};
 
 gpui_kit::actions!(
     text_editor,
@@ -104,6 +106,14 @@ gpui_kit::actions!(
         ResetZoom,
         UseLightTheme,
         UseDarkTheme,
+        /// Ask GitHub whether a newer version has been released.
+        CheckForUpdates,
+        /// Check for updates now and then, and install them.
+        ToggleAutomaticUpdates,
+        /// Quit and start the version just installed.
+        RestartToUpdate,
+        ShowReleaseNotes,
+        About,
         Quit,
     ]
 );
@@ -137,6 +147,7 @@ gpui_kit::assets::icon_assets!(
         Circle,
         Columns2,
         Database,
+        Download,
         FileArchive,
         FileBraces,
         FileCode,
@@ -261,6 +272,9 @@ struct MenuChecks {
     markdown: bool,
     preview: Preview,
     dark: bool,
+    automatic_updates: bool,
+    /// A new version is installed, waiting for a restart.
+    update_installed: bool,
 }
 
 /// The menu bar's menus. Each item dispatches its action to whatever had
@@ -332,6 +346,14 @@ fn app_menus(checks: MenuChecks) -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("Light Theme", UseLightTheme).checked(!checks.dark),
             MenuItem::action("Dark Theme", UseDarkTheme).checked(checks.dark),
+        ]),
+        Menu::new("Help").items([
+            MenuItem::action("Check for Updates…", CheckForUpdates),
+            MenuItem::action("Update Automatically", ToggleAutomaticUpdates).checked(checks.automatic_updates),
+            MenuItem::action("Restart to Update", RestartToUpdate).disabled(!checks.update_installed),
+            MenuItem::separator(),
+            MenuItem::action("Release Notes", ShowReleaseNotes),
+            MenuItem::action("About Gitstepwise", About),
         ]),
     ]
 }
@@ -528,6 +550,8 @@ struct Workspace {
     /// no project, and stays unlocked across project switches.
     credentials: Entity<CredentialsPanel>,
     credentials_visible: bool,
+    /// Checks for new versions and installs them.
+    updater: Entity<Updater>,
     /// The terminals, once one has been opened.
     terminal: Option<Entity<TerminalPanel>>,
     terminal_visible: bool,
@@ -608,7 +632,11 @@ impl Workspace {
         });
         let credentials = cx.new(|cx| CredentialsPanel::new(window, cx));
         let branches = cx.new(|cx| BranchesPanel::new(window, cx));
+        let updater = cx.new(Updater::new);
         let mut subscriptions = vec![
+            cx.subscribe_in(&updater, window, Self::on_updater_event),
+            // The status bar shows a download, and a restart waiting.
+            cx.observe(&updater, |_, _, cx| cx.notify()),
             cx.subscribe_in(&explorer, window, Self::on_explorer_event),
             cx.subscribe_in(&notes, window, Self::on_notes_event),
             cx.subscribe_in(&credentials, window, Self::on_credentials_event),
@@ -670,6 +698,7 @@ impl Workspace {
             _git_task: None,
             credentials,
             credentials_visible: false,
+            updater,
             terminal: None,
             terminal_visible: false,
             terminal_height: px(260.),
@@ -1953,6 +1982,8 @@ impl Workspace {
             markdown: doc.is_some_and(Document::is_markdown),
             preview: doc.map_or(Preview::Off, |doc| doc.preview),
             dark: cx.theme().is_dark(),
+            automatic_updates: self.updater.read(cx).automatic(),
+            update_installed: matches!(self.updater.read(cx).state(), UpdateState::Installed(_)),
         };
         if self.menu_checks == Some(checks) {
             return;
@@ -2829,6 +2860,103 @@ impl Workspace {
         Theme::change(ThemeMode::Dark, Some(window), cx);
     }
 
+    // ---- Updates -----------------------------------------------------------
+
+    fn on_updater_event(
+        &mut self,
+        _: &Entity<Updater>,
+        event: &UpdaterEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            UpdaterEvent::Found(release) => self.offer_update(release.clone(), window, cx),
+            UpdaterEvent::Status { message, is_error } => self.set_status(message.clone(), *is_error, cx),
+        }
+    }
+
+    /// Ask whether to install a newer version.
+    fn offer_update(&mut self, release: Release, window: &mut Window, cx: &mut Context<Self>) {
+        let answer = window.prompt(
+            PromptLevel::Info,
+            &format!("{APP_NAME} {} is available", release.version),
+            Some(&format!(
+                "You have {}. Install the new version now? It's used from the next start.",
+                updater::VERSION
+            )),
+            &["Install", "Release Notes", "Not Now"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(answer) = answer.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.updater.update(cx, |updater, cx| match answer {
+                    0 => updater.install(release, cx),
+                    1 => {
+                        cx.open_url(&release.page);
+                        updater.postpone(release, cx);
+                    }
+                    _ => updater.postpone(release, cx),
+                })
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn check_for_updates(&mut self, _: &CheckForUpdates, _: &mut Window, cx: &mut Context<Self>) {
+        self.updater.update(cx, |updater, cx| updater.check(true, cx));
+    }
+
+    fn toggle_automatic_updates(&mut self, _: &ToggleAutomaticUpdates, _: &mut Window, cx: &mut Context<Self>) {
+        self.updater.update(cx, |updater, cx| {
+            let automatic = !updater.automatic();
+            updater.set_automatic(automatic, cx);
+        });
+    }
+
+    /// Quit, once unsaved changes are saved or discarded, and start the new
+    /// version. With none installed yet, check for one.
+    fn restart_to_update(&mut self, _: &RestartToUpdate, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.updater.read(cx).state(), UpdateState::Installed(_)) {
+            self.updater.update(cx, |updater, cx| updater.check(true, cx));
+            return;
+        }
+        self.confirm_close_all(
+            window,
+            cx,
+            Box::new(|this, _, cx| {
+                this.updater.read(cx).relaunch_after_quit();
+                cx.quit();
+            }),
+        );
+    }
+
+    fn show_release_notes(&mut self, _: &ShowReleaseNotes, _: &mut Window, cx: &mut Context<Self>) {
+        cx.open_url(&updater::releases_page());
+    }
+
+    fn about(&mut self, _: &About, window: &mut Window, cx: &mut Context<Self>) {
+        let answer = window.prompt(
+            PromptLevel::Info,
+            &format!("{APP_NAME} {}", updater::VERSION),
+            Some(&format!(
+                "A small code editor for reading what changed, one step at a time, before you commit it.\n\n{}",
+                updater::REPOSITORY
+            )),
+            &["OK", "Release Notes"],
+            cx,
+        );
+        cx.spawn(async move |_, cx| {
+            if let Ok(1) = answer.await {
+                cx.update(|cx| cx.open_url(&updater::releases_page()));
+            }
+        })
+        .detach();
+    }
+
     fn quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
         self.confirm_close_all(window, cx, Box::new(|_, _, cx| cx.quit()));
     }
@@ -3306,6 +3434,68 @@ impl Workspace {
             .child(div().flex_1().min_h_0().child(terminal.clone()))
     }
 
+    /// An update on its way, for the status bar: being looked for (when
+    /// asked), downloading, found, or installed and waiting for a restart.
+    fn render_update_status(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = cx.theme();
+        let (foreground, accent) = (theme.foreground, theme.primary);
+        let busy = |label: String| {
+            div()
+                .h_flex()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .child(Spinner::new().xsmall())
+                .child(label)
+                .into_any_element()
+        };
+        let element = match self.updater.read(cx).state() {
+            UpdateState::Idle | UpdateState::Checking { asked: false } => return None,
+            UpdateState::Checking { asked: true } => busy("Checking for updates…".into()),
+            UpdateState::Downloading(version) => busy(format!("Downloading {APP_NAME} {version}…")),
+            UpdateState::Available(release) => {
+                let version = release.version.clone();
+                div()
+                    .id("update-available")
+                    .h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(foreground))
+                    .child(Icon::new(LucideIcon::Download).xsmall())
+                    .child(format!("{APP_NAME} {version} available"))
+                    .tooltip(move |window, cx| Tooltip::new(format!("Get {APP_NAME} {version}")).build(window, cx))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.updater.update(cx, |updater, cx| updater.offer(cx));
+                    }))
+                    .into_any_element()
+            }
+            UpdateState::Installed(version) => {
+                let version = version.clone();
+                div()
+                    .id("update-installed")
+                    .h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .cursor_pointer()
+                    .text_color(accent)
+                    .hover(|style| style.text_color(foreground))
+                    .child(Icon::new(LucideIcon::RotateCw).xsmall())
+                    .child("Restart to update")
+                    .tooltip(move |window, cx| {
+                        Tooltip::new(format!("{APP_NAME} {version} is installed. Restart to use it.")).build(window, cx)
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.restart_to_update(&RestartToUpdate, window, cx);
+                    }))
+                    .into_any_element()
+            }
+        };
+        Some(element)
+    }
+
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let doc = self.active_document();
@@ -3372,6 +3562,9 @@ impl Workspace {
             })
             .on_click(cx.listener(|this, _, window, cx| this.toggle_notes(&ToggleNotes, window, cx)));
 
+        let update = self.render_update_status(cx);
+        let theme = cx.theme();
+
         let (message, message_color) = match &self.status {
             Some(status) if status.is_error => (status.message.clone(), theme.danger),
             Some(status) => (status.message.clone(), theme.muted_foreground),
@@ -3436,6 +3629,7 @@ impl Workspace {
                     .flex_none()
                     .gap_4()
                     .when_some(self.fps.as_ref(), |row, meter| row.child(meter.label()))
+                    .children(update)
                     .children(file_info.into_iter().flatten())
                     .child(credentials_button)
                     .child(notes_button)
@@ -3584,6 +3778,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::reset_zoom))
             .on_action(cx.listener(Self::use_light_theme))
             .on_action(cx.listener(Self::use_dark_theme))
+            .on_action(cx.listener(Self::check_for_updates))
+            .on_action(cx.listener(Self::toggle_automatic_updates))
+            .on_action(cx.listener(Self::restart_to_update))
+            .on_action(cx.listener(Self::show_release_notes))
+            .on_action(cx.listener(Self::about))
             .on_action(cx.listener(Self::quit))
             .on_drop(cx.listener(Self::on_drop_paths))
             // Dragging a divider.
@@ -3880,4 +4079,7 @@ fn main() {
 
             cx.activate(true);
         });
+
+    // Restart to Update quit the app: start the version it installed.
+    updater::relaunch_if_asked();
 }
