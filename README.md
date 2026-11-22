@@ -58,7 +58,7 @@ was made. Step through until you've seen everything, then commit.
 **The editor itself**
 
 - Tabs, the file explorer, and an integrated terminal. The terminal icon at the
-  left of the status bar shows or hides it.
+  right end of the status bar shows or hides it.
 - Split the terminal side by side or one above the other, as many times as you
   like, and drag the dividers to resize. Use the buttons in the terminal's
   header, View → Split Terminal Right or Down, or the keys below.

@@ -2213,7 +2213,6 @@ impl Workspace {
                     .min_w_0()
                     .items_center()
                     .gap_4()
-                    .child(terminal_button)
                     // The branch, and how many files changed; click for the Changes view.
                     .when_some(self.branch.clone(), |row, branch| {
                         let changed = match self.changed_files {
@@ -2245,7 +2244,8 @@ impl Workspace {
                     .flex_none()
                     .gap_4()
                     .when_some(self.fps.as_ref(), |row, meter| row.child(meter.label()))
-                    .children(file_info.into_iter().flatten()),
+                    .children(file_info.into_iter().flatten())
+                    .child(terminal_button),
             )
     }
 }
