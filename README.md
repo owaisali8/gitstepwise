@@ -46,6 +46,32 @@ was made. Step through until you've seen everything, then commit.
   commits on the branch, newest first, and what each one changed. Right-click a
   file or folder and choose **View History** for only the commits that touched it.
 
+**Branches, as in GitHub Desktop**
+
+- **Current branch** in the title bar opens the list of branches: the default
+  branch, recent ones, then the rest, with how long ago each was last
+  committed to. Type to filter it, and click a branch, or press Enter, to
+  switch to it. A branch that's only on the remote gets a local branch that
+  tracks it.
+- **New branch** (or Ctrl+Shift+N) creates a branch from the current one, or
+  from the default branch, and switches to it. Spaces and other characters Git
+  won't take become hyphens.
+- Switching with changes not committed asks whether to bring them along, or
+  leave them on the branch they were made on. Changes left behind are stashed,
+  and the list offers to restore them when you come back.
+- **Choose a branch to merge into…** at the bottom of the list (or
+  Ctrl+Shift+M) shows how many commits a merge would bring and whether files
+  would conflict, then merges. After conflicts, resolve the files and commit,
+  or use **Abort Merge** in the list.
+- Next to it, **Fetch origin** checks the remote for new commits and says when
+  it last did. It becomes **Pull origin** when the remote has commits the
+  branch doesn't, **Push origin** when the branch has commits the remote
+  doesn't, and **Publish branch** for a branch that isn't on the remote yet.
+  Pulling merges, unless Git is set to rebase.
+- The **Pull requests** tab opens the repository's pull requests, or a new
+  one for the current branch, on GitHub or GitLab, in your browser.
+- The **Branch** menu has all of these too.
+
 **Projects**
 
 - Open a folder and it becomes a project. Switch to another, as in Zed, with
@@ -162,6 +188,8 @@ On macOS, use Cmd in place of Ctrl.
 | Switch project | Ctrl+Alt+O |
 | Show or hide notes and to-dos | Ctrl+Alt+B |
 | Show or hide credentials | Ctrl+Alt+K |
+| Branches / new branch / merge into the current branch | Ctrl+Shift+B / Ctrl+Shift+N / Ctrl+Shift+M |
+| Pull / push | Ctrl+Shift+P / Ctrl+P |
 | Save / Save as | Ctrl+S / Ctrl+Shift+S |
 | Close tab | Ctrl+W |
 | Next / previous tab | Ctrl+Tab / Ctrl+Shift+Tab (or Ctrl+PageDown / Ctrl+PageUp) |
@@ -198,6 +226,9 @@ opens. These act on the selected file or folder:
 
 In the **History** view, N and P go to older and newer commits.
 
+In the **list of branches** and the merge dialog, the arrow keys move through
+the branches while you type, Enter switches (or merges), and Escape closes.
+
 In **Credentials**, the arrow keys move through the list, Enter copies the
 password (and closes), Ctrl+Enter copies the username, and Escape closes (or
 leaves a form without saving).
@@ -228,11 +259,13 @@ starts again from the new commit.
 | Path | What it holds |
 | --- | --- |
 | `src/main.rs` | The window: title bar and menus, tabs, editor, status bar and shortcuts |
+| `src/branches.rs` | The list of branches, and the dialogs to create a branch and to merge one |
 | `src/changes.rs` | The Changes tab: timeline, by-file and all-files review, and commit history |
 | `src/credentials.rs` | The credentials panel: searching, copying and editing credentials |
 | `src/timeline.rs` | The file watcher and the edit timeline |
 | `src/vault.rs` | The encrypted credentials vault and its search |
 | `src/git.rs` | Reading the repository through the `git` command, and line diffs |
+| `src/git_branches.rs` | Branches through `git`: listing, switching, merging, stashing, fetch, pull and push |
 | `src/explorer.rs` | The file explorer |
 | `src/file_icons.rs` | The explorer's icon and color for each kind of file |
 | `src/markdown.rs` | Where the Markdown preview's links and images lead |

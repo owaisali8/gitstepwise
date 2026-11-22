@@ -30,17 +30,17 @@ CI (`.github/workflows/ci.yml`, windows-latest) runs `cargo build --locked --all
 It's one binary crate. `src/main.rs` holds `Workspace`, the root view, which owns everything else:
 
 - **Documents**: one tab per open file, each with its own `EditorState`.
-- **Child views**: `Explorer`, `ChangesView`, `NotesPanel`, `CredentialsPanel`, the optional `TerminalPanel` (which holds a `TerminalView` for each split terminal), and the `ProjectPicker` while it shows.
+- **Child views**: `Explorer`, `ChangesView`, `NotesPanel`, `CredentialsPanel`, `BranchesPanel` (and the `MergeDialog`, `NewBranchDialog` and `MessageDialog` while they show), the optional `TerminalPanel` (which holds a `TerminalView` for each split terminal), and the `ProjectPicker` while it shows.
 - **Repository state**: the `git::Repo` and the `Timeline`.
 
 **How the views talk:**
-- **Upward, by events:** child views emit events (`ExplorerEvent`, `ChangesEvent`, `NotesEvent`, `CredentialsEvent`, `TerminalPanelEvent`) that `Workspace` subscribes to in `Workspace::new`. The terminal panel is created on first use, so its subscription is made in `start_terminal`. Each `TerminalView` emits `TerminalEvent` to its panel.
+- **Upward, by events:** child views emit events (`ExplorerEvent`, `ChangesEvent`, `NotesEvent`, `CredentialsEvent`, `BranchesEvent`, `TerminalPanelEvent`) that `Workspace` subscribes to in `Workspace::new`. The terminal panel is created on first use, so its subscription is made in `start_terminal`. Each `TerminalView` emits `TerminalEvent` to its panel.
 - **Downward, by direct calls:** `Workspace` calls into child views with `entity.update(cx, ...)`.
 - **Rule:** new cross-view behavior goes through an event plus a `Workspace` handler. Child views don't hold references to each other.
 
 **Actions, keys and menus:**
 - **Actions:** each module declares its own with `gpui_kit::actions!` and binds keys in its `bind_keys`. `main.rs`'s `bind_keys` calls all of them.
-- **Key contexts:** each view has its own key context: `"TextEditor"` for the workspace, and `"Explorer"`, `"Changes"`, `"Terminal"` and `"Credentials"` inside it. The workspace's bindings apply in every child view too.
+- **Key contexts:** each view has its own key context: `"TextEditor"` for the workspace, and `"Explorer"`, `"Changes"`, `"Terminal"`, `"Credentials"` and `"Branches"` inside it. The workspace's bindings apply in every child view too.
 - **Taking a key from an outer view:** a binding in a more specific context wins. Key bindings run before `on_key_down` handlers, and a handled action stops there. So a child view that wants a key an outer context binds must bind it in its own context; handling it in `on_key_down` isn't enough. That's why the terminal binds Tab (the window uses it to move focus) and Ctrl+Shift+V (`PasteClipboard`; the workspace binds it to the Markdown preview). The terminal panel's keys are bound in `"Terminal"` too, and their actions bubble up to the panel or the workspace.
 - **Keystrokes:** `KeyBinding::new` needs `&'static str` and doesn't resolve `secondary-`. Build keystrokes with the `primary!` macro (`concat!`, Cmd on macOS and Ctrl elsewhere), not `format!`. It's defined separately in `main.rs` and `explorer.rs`, so a new module that needs it gets its own copy. `KeyBinding::new` panics on a keystroke it can't parse, which stops the app at startup; `terminal_panel.rs` builds its list in a function so a test can check it.
 - **Menus:** the View menu's check marks come from `MenuChecks`. `sync_menus` runs on every render and reinstalls the menus only when a check changes. A new checked or disabled menu state needs a field there.
@@ -95,6 +95,15 @@ It's one binary crate. `src/main.rs` holds `Workspace`, the root view, which own
 - `CredentialsPanel` is created once in `Workspace::new`, so the vault stays unlocked across project switches. It shows over a dimmed backdrop that closes it on click. Screens: `Create`, `Locked`, `Open(Vault)`; when open, `Pane` says what the right side shows.
 - The list's rows hold copies without secrets (`Credential::without_secret`), searched by `vault::search`. Enter in the list is caught with `capture_action::<Confirm>` to copy the password: a click on a row confirms it too, but without dispatching `Confirm`, so a click only selects.
 - `touch` restarts the 15-minute auto-lock (`LOCK_AFTER`). A copied password is cleared from the clipboard after `CLEAR_AFTER` (and on quit) if it's still there.
+
+**Branches (`git_branches.rs`, `branches.rs`):**
+- `git_branches.rs` adds branch operations to `git::Repo` (an `impl Repo` block in its own file): `branches()` (local branches, then remote branches no local branch tracks; the default branch from `origin/HEAD`; recent ones from HEAD's reflog), `sync_status()` (upstream, ahead/behind, `FETCH_HEAD`'s time), switching, creating, stashing, merging, fetch, pull and push. Operations go through `op`, which sets `GIT_TERMINAL_PROMPT=0` so Git fails rather than waits for a password, and returns Git's message without its `error:`/`hint:` lines. Its tests make throwaway repositories, with a bare one as the remote.
+- Merge and pull outcomes are read from HEAD before and after, not from Git's (translatable) output. `merge_preview` uses `git merge-tree --write-tree` (Git 2.38+), else says `Unknown`.
+- Changes left on a branch are a stash whose message is `Gitstepwise: changes left on <branch>`; `stash_for` finds it.
+- `branches.rs` has the views: `BranchList` (sections, filter, selection, shared by `BranchesPanel` and `MergeDialog`), `NewBranchDialog` and `MessageDialog`. Their filter is the kit's `InputState`: the views take Up and Down with `capture_action::<MoveUp/MoveDown>` before the input does, and Enter from `InputEvent::PressEnter`.
+- `MessageDialog` stands in for `window.prompt` for branch questions and Git's errors: GPUI's fallback prompt on Linux doesn't wrap text. `Workspace::ask` shows one and calls back with the button pressed.
+- The views only emit events; `Workspace` runs every operation through `run_git` (one at a time, in the background, with `git_busy` shown on the fetch button), after `confirm_close_all` where files change. `after_git` then reloads tabs without unsaved changes from disk (`reload_clean_documents`; a tab whose file is gone closes), and refreshes the explorer, the gutter, the Changes view, the timeline (a new HEAD starts it afresh) and the list.
+- The title bar's "Current branch" button records where it's drawn (a `canvas` into `branch_button`), so the list opens under it. `Repo::stamp` includes `FETCH_HEAD`, so a fetch made elsewhere updates the fetch button.
 
 **Markdown preview:**
 - Each `Document` has a `Preview` mode and a `TextViewState`, updated from `InputEvent::Change`.
