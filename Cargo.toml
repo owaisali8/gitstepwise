@@ -1,6 +1,6 @@
 [package]
 name = "gitstepwise"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 # Where updates come from: the releases of this repository on GitHub.
 repository = "https://github.com/owaisali8/gitstepwise"
