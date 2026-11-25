@@ -48,7 +48,7 @@ was made. Step through until you've seen everything, then commit.
 
 **Branches, as in GitHub Desktop**
 
-- **Current branch** in the title bar opens the list of branches: the default
+- **Current branch** in the toolbar opens the list of branches: the default
   branch, recent ones, then the rest, with how long ago each was last
   committed to. Type to filter it, and click a branch, or press Enter, to
   switch to it. A branch that's only on the remote gets a local branch that
@@ -75,7 +75,7 @@ was made. Step through until you've seen everything, then commit.
 **Projects**
 
 - Open a folder and it becomes a project. Switch to another, as in Zed, with
-  the project's name in the title bar, File → Open Recent…, or Ctrl+Alt+O:
+  **Current project** in the toolbar, File → Open Recent…, or Ctrl+Alt+O:
   type to narrow the list, then Enter.
 - Each project remembers the files open in it. They open again when you come
   back to it, or when Gitstepwise starts without a folder or file to open.
@@ -128,7 +128,9 @@ was made. Step through until you've seen everything, then commit.
   updating as you type. Links to other files open them in a tab, and images
   stored with the file are shown (images on the web aren't yet).
 - Word wrap, line numbers, zoom, and light and dark themes.
-- Its own title bar with File, Edit, Branch, View and Help menus.
+- Its own title bar with File, Edit, Branch, View and Help menus, and a
+  toolbar under it, as in GitHub Desktop: the current project, the current
+  branch, and Fetch, Pull or Push.
 
 **Updates**
 

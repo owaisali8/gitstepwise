@@ -127,6 +127,9 @@ struct OpenLinkedPath(PathBuf);
 const APP_NAME: &str = "Gitstepwise";
 const KEY_CONTEXT: &str = "TextEditor";
 const PLAIN_TEXT: &str = "text";
+/// The height of the bar under the title bar with the project, branch and
+/// fetch buttons.
+const TOOLBAR_HEIGHT: Pixels = px(44.);
 const MIN_TERMINAL_HEIGHT: Pixels = px(80.);
 const MIN_SIDEBAR_WIDTH: Pixels = px(140.);
 const MIN_NOTES_WIDTH: Pixels = px(200.);
@@ -3011,21 +3014,7 @@ impl Workspace {
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.toggle_sidebar(&ToggleSidebar, window, cx)
                                     })),
-                            )
-                            // The project's name; click to switch to another.
-                            .child(
-                                Button::new("switch-project")
-                                    .ghost()
-                                    .xsmall()
-                                    .label(projects::folder_name(&self.default_folder(cx)))
-                                    .dropdown_caret(true)
-                                    .selected(self.project_picker.is_some())
-                                    .tooltip(format!("Switch project ({})", shortcut("Alt+O")))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_recent(&OpenRecent, window, cx)
-                                    })),
-                            )
-                            .children(self.render_branch_buttons(cx)),
+                            ),
                     ),
             )
             .child(
@@ -3041,8 +3030,37 @@ impl Workspace {
             )
     }
 
-    /// A button in the title bar like GitHub Desktop's toolbar: an icon, a
-    /// small caption over a title, and maybe a caret.
+    /// The bar under the title bar, as in GitHub Desktop: the current
+    /// project, and in a repository the current branch and the fetch button.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let project = Self::toolbar_button(
+            "switch-project",
+            Icon::new(IconName::Folder).small(),
+            "Current project",
+            projects::folder_name(&self.default_folder(cx)),
+            self.project_picker.is_some(),
+            true,
+            cx,
+        )
+        .tooltip(|window, cx| Tooltip::new(format!("Switch project ({})", shortcut("Alt+O"))).build(window, cx))
+        .on_click(cx.listener(|this, _, window, cx| this.open_recent(&OpenRecent, window, cx)));
+
+        div()
+            .h_flex()
+            .flex_none()
+            .w_full()
+            .h(TOOLBAR_HEIGHT)
+            .overflow_hidden()
+            .bg(theme.title_bar)
+            .border_b_1()
+            .border_color(theme.title_bar_border)
+            .child(project)
+            .children(self.render_branch_buttons(cx))
+    }
+
+    /// A button in the toolbar like GitHub Desktop's: an icon, a small
+    /// caption over a title, and maybe a caret.
     fn toolbar_button(
         id: &'static str,
         icon: impl IntoElement,
@@ -3060,12 +3078,12 @@ impl Workspace {
             .flex_none()
             .items_center()
             .gap_2()
-            .h(TITLE_BAR_HEIGHT)
+            .h_full()
             .pl_3()
             .pr_2()
-            .min_w(px(150.))
-            .max_w(px(240.))
-            .border_l_1()
+            .min_w(px(180.))
+            .max_w(px(260.))
+            .border_r_1()
             .border_color(theme.title_bar_border)
             .cursor_pointer()
             .when(open, |button| button.bg(theme.secondary))
@@ -3658,7 +3676,7 @@ impl Render for Workspace {
             theme.accent,
         );
         let viewport = window.viewport_size();
-        let max_terminal_height = (viewport.height - px(160.)).max(MIN_TERMINAL_HEIGHT);
+        let max_terminal_height = (viewport.height - px(204.)).max(MIN_TERMINAL_HEIGHT);
         let max_sidebar_width = (viewport.width - px(300.)).max(MIN_SIDEBAR_WIDTH);
         let max_notes_width = (viewport.width - px(300.)).max(MIN_NOTES_WIDTH);
         let terminal = self
@@ -3827,6 +3845,7 @@ impl Render for Workspace {
             .bg(background)
             .text_color(foreground)
             .child(self.render_title_bar(cx))
+            .child(self.render_toolbar(cx))
             .child(
                 div()
                     .h_flex()
@@ -3863,7 +3882,7 @@ impl Render for Workspace {
                 root.child(
                     div()
                         .absolute()
-                        .top(px(48.))
+                        .top(TITLE_BAR_HEIGHT + TOOLBAR_HEIGHT + px(8.))
                         .left_0()
                         .right_0()
                         .h_flex()
@@ -3872,20 +3891,21 @@ impl Render for Workspace {
                 )
             })
             // The branch list, under its button and down to the bottom, over
-            // a dimmed window below the title bar.
+            // a dimmed window below the toolbar.
             .when(self.branches_visible, |root| {
                 let width = px(440.);
+                let top = TITLE_BAR_HEIGHT + TOOLBAR_HEIGHT;
                 let left = self
                     .branch_button
                     .get()
-                    .map_or(px(240.), |bounds| bounds.left())
+                    .map_or(px(180.), |bounds| bounds.left())
                     .min(viewport.width - width - px(8.))
-                    .max(px(8.));
+                    .max(px(0.));
                 root.child(
                     div()
                         .id("branches-backdrop")
                         .absolute()
-                        .top(TITLE_BAR_HEIGHT)
+                        .top(top)
                         .left_0()
                         .right_0()
                         .bottom_0()
@@ -3899,7 +3919,7 @@ impl Render for Workspace {
                 .child(
                     div()
                         .absolute()
-                        .top(TITLE_BAR_HEIGHT)
+                        .top(top)
                         .left(left)
                         .w(width)
                         .bottom(px(8.))
